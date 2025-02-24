@@ -1,6 +1,8 @@
 # Comparing Brain-Behavior Relationships Across Dimensional, Tail-Sampled, and Propensity-Matched Models #
 *Large population cohorts are needed to perform brain-wide association studies (BWAS), with evidence that sampling from the tails of a distribution increases effect sizes and improves reproducibility. However, studies rarely compare how variability in sample sociodemographic characteristics relates to imaging or behavioral phenotypes within BWAS. To address this gap, we derived estimates for brain-behavior associations using multivariate regression models, comparing effects sizes for dimensional, tail-sampled, and propensity matched groups. Data were obtained from the Adolescent Brain Cognitive Development (ABCD) Study®.*
 
+![alt text](github_fig.png)
+
 ## Project Lead
 Kristin A. Murtha
 
