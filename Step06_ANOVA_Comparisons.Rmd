@@ -1,0 +1,769 @@
+---
+title: "Topography Matching Notebook Step 2"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R Notebook runs multivariate multiple regression to model the cumulative effects of network group on clinical, cognitive and exposome outcomes:
+
+First, install necessary packages.
+
+```{r}
+library(MatchIt)
+library(boxr)
+library(tidyr)
+library(dplyr)
+library(cobalt)
+library(ggplot2)
+library(finalfit)
+library(Hmisc)
+library(lm.beta)
+library(ggpubr)
+library(bayesbio)
+library(mde)
+library(lavaan) 
+library(knitr)
+library(kableExtra)
+library(broom)
+library(multcomp)
+library(Gmisc)
+```
+
+Specify that select function should be pulled from dplyr
+
+```{r}
+select <- dplyr::select
+recode <- dplyr::recode
+
+`%ni%` <- Negate(`%in%`)
+```
+
+Next, log into PennBox, and set working directory the ABCD directory.
+
+```{r}
+box_auth()
+
+box_setwd('167848222541')
+```
+
+Load in matched network data, code new group variable:
+```{r}
+match_vent_data<-box_read('1438682877497', fread=TRUE)
+match_vent_data<- match_vent_data %>%
+  mutate(anova_group = case_when(group == 0 ~ 'match_low', 
+                                 group == 1 ~ 'match_high'))%>%
+  select(-group, -distance, -weights, -subclass)
+match_sGMV_data<-box_read('1438681749218', fread=TRUE)
+match_sGMV_data<- match_sGMV_data %>%
+  mutate(anova_group = case_when(group == 0 ~ 'match_low', 
+                                 group == 1 ~ 'match_high'))%>%
+  select(-group, -distance, -weights, -subclass)
+match_WMV_data<-box_read('1438687945370', fread=TRUE)
+match_WMV_data<- match_WMV_data %>%
+  mutate(anova_group = case_when(group == 0 ~ 'match_low', 
+                                 group == 1 ~ 'match_high'))%>%
+  select(-group, -distance, -weights, -subclass)
+match_GMV_data<-box_read('1438677748369', fread=TRUE)
+match_GMV_data<- match_GMV_data %>%
+  mutate(anova_group = case_when(group == 0 ~ 'match_low', 
+                                 group == 1 ~ 'match_high'))%>%
+  select(-group, -distance, -weights, -subclass)
+```
+
+load in unmatched network data, code new group variable: 
+```{r}
+unmatched_GMV_data<-box_read('1442236849436', fread=TRUE)
+unmatched_GMV_data<- unmatched_GMV_data%>%
+  filter(subjectkey %ni% match_GMV_data$subjectkey)%>%
+  mutate(anova_group = case_when(group == 0 ~ 'tails_low', 
+                                 group == 1 ~ 'tails_high'))%>%
+  select(-group)
+
+unmatched_WMV_data<-box_read('1442223376606', fread=TRUE)
+unmatched_WMV_data<- unmatched_WMV_data %>%
+  filter(subjectkey %ni% match_WMV_data$subjectkey)%>%
+  mutate(anova_group = case_when(group == 0 ~ 'tails_low', 
+                                 group == 1 ~ 'tails_high'))%>%
+  select(-group)
+  
+unmatched_sGMV_data<-box_read('1442239979732', fread=TRUE)
+unmatched_sGMV_data<- unmatched_sGMV_data%>%
+  filter(subjectkey %ni% match_sGMV_data$subjectkey)%>%
+  mutate(anova_group = case_when(group == 0 ~ 'tails_low', 
+                                 group == 1 ~ 'tails_high'))%>%
+  select(-group)
+
+unmatched_vent_data<-box_read('1442240154828', fread=TRUE)
+unmatched_vent_data <- unmatched_vent_data%>%
+  filter(subjectkey %ni% match_vent_data$subjectkey)%>%
+  mutate(anova_group = case_when(group == 0 ~ 'tails_low', 
+                                 group == 1 ~ 'tails_high'))%>%
+  select(-group)
+```
+
+Load in dimensional network data, identify p's who are not in other samples (ie: matched, tails): 
+```{r}
+all_dimensional_data<-box_read('1442204075893', fread=TRUE)
+
+avg_GMV_data<- filter(all_dimensional_data, subjectkey %ni% match_GMV_data$subjectkey)%>%
+  filter(subjectkey %ni% unmatched_GMV_data$subjectkey)%>%
+  mutate(anova_group = 'avg')
+
+avg_WMV_data<- filter(all_dimensional_data, subjectkey %ni% match_WMV_data$subjectkey)%>%
+  filter(subjectkey %ni% unmatched_WMV_data$subjectkey)%>%
+  mutate(anova_group = 'avg')
+
+avg_sGMV_data<- filter(all_dimensional_data, subjectkey %ni% match_sGMV_data$subjectkey)%>%
+  filter(subjectkey %ni% unmatched_sGMV_data$subjectkey)%>%
+  mutate(anova_group = 'avg')
+
+avg_vent_data<- filter(all_dimensional_data, subjectkey %ni% match_vent_data$subjectkey)%>%
+  filter(subjectkey %ni% unmatched_vent_data$subjectkey)%>%
+  mutate(anova_group = 'avg')
+```
+
+Make datasets of each tissue type with new anova group variable, make it a factor, and make sure that all chi-square v's are factors. 
+```{r}
+all_GMV_data<- rbind(match_GMV_data, unmatched_GMV_data, avg_GMV_data)%>%
+  mutate(anova_group = as.factor(anova_group))%>%
+  mutate(sex = as.factor(sex))%>%
+  mutate(race_3 = as.factor(race_3))%>%
+  mutate(site_id = as.factor(site_id))%>%
+  mutate(ethnicity = as.factor(ethnicity))
+
+all_WMV_data<- rbind(match_WMV_data, unmatched_WMV_data, avg_WMV_data)%>%
+  mutate(anova_group = as.factor(anova_group))%>%
+  mutate(sex = as.factor(sex))%>%
+  mutate(race_3 = as.factor(race_3))%>%
+  mutate(site_id = as.factor(site_id))%>%
+  mutate(ethnicity = as.factor(ethnicity))
+
+all_sGMV_data<- rbind(match_sGMV_data, unmatched_sGMV_data, avg_sGMV_data)%>%
+  mutate(anova_group = as.factor(anova_group))%>%
+  mutate(sex = as.factor(sex))%>%
+  mutate(race_3 = as.factor(race_3))%>%
+  mutate(site_id = as.factor(site_id))%>%
+  mutate(ethnicity = as.factor(ethnicity))
+
+all_vent_data<- rbind(match_vent_data, unmatched_vent_data, avg_vent_data)%>%
+  mutate(anova_group = as.factor(anova_group))%>%
+  mutate(sex = as.factor(sex))%>%
+  mutate(race_3 = as.factor(race_3))%>%
+  mutate(site_id = as.factor(site_id))%>%
+  mutate(ethnicity = as.factor(ethnicity))
+```
+
+Make Demo Tables
+```{r}
+GMV_table <- all_GMV_data %>%
+  set_column_labels(age = "Age (Years)",
+                    sex = "Sex",
+                    puberty_stage = "Pubertal Stage", 
+                    ethnicity = 'Ethnicity',
+                    race_3 = "Race",
+                    parent_education = "Parent Education",
+                    combined_income = "Household Income", 
+                    GMV = 'cGM', 
+                    WMV = 'WM', 
+                    sGMV = 'sGM', 
+                    Ventricles = 'CSF', 
+                    euler = 'Motion (Euler)') %>%
+getDescriptionStatsBy(age, 
+                      sex,
+                      puberty_stage,
+                      ethnicity,
+                      race_3,
+                      parent_education,
+                      combined_income,
+                      euler, 
+                      GMV, 
+                      WMV, 
+                      sGMV, 
+                      Ventricles,
+                      add_total_col = TRUE, statistics=FALSE, show_all_values=TRUE,
+                      digits=2,
+                      by = anova_group)
+GMV_table
+```
+
+Make Demo Tables
+```{r}
+WMV_table <- all_WMV_data %>%
+  set_column_labels(age = "Age (Years)",
+                    sex = "Sex",
+                    puberty_stage = "Pubertal Stage", 
+                    ethnicity = 'Ethnicity',
+                    race_3 = "Race",
+                    parent_education = "Parent Education",
+                    combined_income = "Household Income", 
+                    GMV = 'cGM', 
+                    WMV = 'WM', 
+                    sGMV = 'sGM', 
+                    Ventricles = 'CSF', 
+                    euler = 'Motion (Euler)') %>%
+getDescriptionStatsBy(age, 
+                      sex,
+                      puberty_stage,
+                      ethnicity,
+                      race_3,
+                      parent_education,
+                      combined_income,
+                      euler, 
+                      GMV, 
+                      WMV, 
+                      sGMV, 
+                      Ventricles,
+                      add_total_col = TRUE, statistics=FALSE, show_all_values=TRUE,
+                      digits=2,
+                      by = anova_group)
+WMV_table
+```
+
+Make Demo Tables
+```{r}
+sGMV_table <- all_sGMV_data %>%
+  set_column_labels(age = "Age (Years)",
+                    sex = "Sex",
+                    puberty_stage = "Pubertal Stage", 
+                    ethnicity = 'Ethnicity',
+                    race_3 = "Race",
+                    parent_education = "Parent Education",
+                    combined_income = "Household Income", 
+                    GMV = 'cGM', 
+                    WMV = 'WM', 
+                    sGMV = 'sGM', 
+                    Ventricles = 'CSF', 
+                    euler = 'Motion (Euler)') %>%
+getDescriptionStatsBy(age, 
+                      sex,
+                      puberty_stage,
+                      ethnicity,
+                      race_3,
+                      parent_education,
+                      combined_income,
+                      euler, 
+                      GMV, 
+                      WMV, 
+                      sGMV, 
+                      Ventricles,
+                      add_total_col = TRUE, statistics=FALSE, show_all_values=TRUE,
+                      digits=2,
+                      by = anova_group)
+sGMV_table
+```
+
+Make Demo Tables
+```{r}
+vent_table <- all_vent_data %>%
+  set_column_labels(age = "Age (Years)",
+                    sex = "Sex",
+                    puberty_stage = "Pubertal Stage", 
+                    ethnicity = 'Ethnicity',
+                    race_3 = "Race",
+                    parent_education = "Parent Education",
+                    combined_income = "Household Income", 
+                    GMV = 'cGM', 
+                    WMV = 'WM', 
+                    sGMV = 'sGM', 
+                    Ventricles = 'CSF', 
+                    euler = 'Motion (Euler)') %>%
+getDescriptionStatsBy(age, 
+                      sex,
+                      puberty_stage,
+                      ethnicity,
+                      race_3,
+                      parent_education,
+                      combined_income,
+                      euler, 
+                      GMV, 
+                      WMV, 
+                      sGMV, 
+                      Ventricles,
+                      add_total_col = TRUE, statistics=FALSE, show_all_values=TRUE,
+                      digits=2,
+                      by = anova_group)
+vent_table
+```
+
+List out variables for each type of test
+```{r}
+anova_vs<- c('age', 'GMV', 'WMV', 'sGMV', 'Ventricles', 'parent_education', 
+           'combined_income', 'puberty_stage', 'euler')
+chi_vs<- c('sex', 'race_3', 'site_id', 'ethnicity')
+```
+
+Anova function
+```{r}
+run_anova_tests <- function(data, vars, group_var) {
+  results <- data.frame(
+    Variable = character(),
+    Test_Type = character(),
+    Omnibus_Stat = numeric(),
+    P_Value = numeric(),
+    Comparison = character(),
+    Pairwise_P_Value = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (var in vars) {
+    if (is.numeric(data[[var]])) {
+      # Perform ANOVA
+      aov_model <- aov(data[[var]] ~ as.factor(data[[group_var]]))
+      aov_summary <- summary(aov_model)
+      omnibus_stat <- aov_summary[[1]][["F value"]][1]
+      p_value <- aov_summary[[1]][["Pr(>F)"]][1]
+      
+      # Store omnibus ANOVA result
+      results <- results %>%
+        add_row(
+          Variable = var,
+          Test_Type = "ANOVA",
+          Omnibus_Stat = omnibus_stat,
+          P_Value = p_value,
+          Comparison = NA,
+          Pairwise_P_Value = NA
+        )
+      
+      # Perform Tukey HSD for pairwise comparisons
+      tukey_result <- TukeyHSD(aov_model)
+      tukey_df <- as.data.frame(tukey_result[[1]])
+      tukey_df$Comparison <- rownames(tukey_df)
+      
+      # Add pairwise comparisons to results
+      pairwise_results <- tukey_df %>%
+        select(Comparison, `p adj`) %>%
+        rename(Pairwise_P_Value = `p adj`) %>%
+        mutate(
+          Variable = var,
+          Test_Type = "ANOVA",
+          Omnibus_Stat = NA,
+          P_Value = NA
+        )
+      
+      results <- bind_rows(results, pairwise_results)
+    }
+  }
+  
+  return(results)
+}
+```
+
+
+Run ANOVA functions
+```{r}
+GMV_anova_results <- run_anova_tests(all_GMV_data, anova_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+WMV_anova_results <- run_anova_tests(all_WMV_data, anova_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+sGMV_anova_results <- run_anova_tests(all_sGMV_data, anova_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+vent_anova_results <- run_anova_tests(all_vent_data, anova_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+```
+
+HTML:
+```{r}
+GMV_anova_results%>% kable(format = "html")
+WMV_anova_results%>% kable(format = "html")
+sGMV_anova_results%>% kable(format = "html")
+vent_anova_results%>% kable(format = "html")
+```
+
+Do chi-square by hand because everything is a piece of shit 
+
+GMV:
+```{r warn.conflicts=F, quietly=T}
+matchH_avg<-filter(all_GMV_data, anova_group %in% c("avg", "match_high"))
+matchL_avg<-filter(all_GMV_data, anova_group %in% c("avg", "match_low"))
+tailsH_avg<-filter(all_GMV_data, anova_group %in% c("avg", "tails_high"))
+tailsL_avg<-filter(all_GMV_data, anova_group %in% c("avg", "tails_low"))
+matchH_matchL<-filter(all_GMV_data, anova_group %in% c("match_high", "match_low"))
+matchH_tailsH<-filter(all_GMV_data, anova_group %in% c("match_high", "tails_high"))
+tailsL_matchH<-filter(all_GMV_data, anova_group %in% c("tails_low", "match_high"))
+tailsH_matchL<-filter(all_GMV_data, anova_group %in% c("match_low", "tails_high"))
+tailsL_matchL<-filter(all_GMV_data, anova_group %in% c("tails_low", "match_low"))
+tailsL_tailsH<-filter(all_GMV_data, anova_group %in% c("tails_low", "tails_high"))
+
+sex_om<- chisq.test(all_GMV_data$anova_group, all_GMV_data$sex)
+sex1<-chisq.test(matchH_avg$anova_group, matchH_avg$sex)
+sex2<-chisq.test(matchL_avg$anova_group, matchL_avg$sex)
+sex3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$sex)
+sex4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$sex)
+sex5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$sex)
+sex6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$sex)
+sex7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$sex)
+sex8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$sex)
+sex9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$sex)
+sex10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$sex)
+
+GMV_sex_mult<-c(sex_om$statistic, sex_om$p.value, sex1$p.value, sex2$p.value, sex3$p.value, sex4$p.value, sex5$p.value, sex6$p.value,
+                sex7$p.value, sex8$p.value, sex9$p.value, sex10$p.value)
+
+ethnicity_om<- chisq.test(all_GMV_data$anova_group, all_GMV_data$ethnicity)
+ethnicity1<-chisq.test(matchH_avg$anova_group, matchH_avg$ethnicity)
+ethnicity2<-chisq.test(matchL_avg$anova_group, matchL_avg$ethnicity)
+ethnicity3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$ethnicity)
+ethnicity4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$ethnicity)
+ethnicity5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$ethnicity)
+ethnicity6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$ethnicity)
+ethnicity7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$ethnicity)
+ethnicity8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$ethnicity)
+ethnicity9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$ethnicity)
+ethnicity10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$ethnicity)
+
+GMV_ethnicity_mult<-c(ethnicity_om$statistic, ethnicity_om$p.value, 
+                      ethnicity1$p.value, ethnicity2$p.value, ethnicity3$p.value, ethnicity4$p.value, ethnicity5$p.value, ethnicity6$p.value,
+                  ethnicity7$p.value, ethnicity8$p.value, ethnicity9$p.value, ethnicity10$p.value)
+
+race_3_om<- chisq.test(all_GMV_data$anova_group, all_GMV_data$race_3)
+race_31<-chisq.test(matchH_avg$anova_group, matchH_avg$race_3)
+race_32<-chisq.test(matchL_avg$anova_group, matchL_avg$race_3)
+race_33<-chisq.test(tailsH_avg$anova_group, tailsH_avg$race_3)
+race_34<-chisq.test(tailsL_avg$anova_group, tailsL_avg$race_3)
+race_35<-chisq.test(matchH_matchL$anova_group, matchH_matchL$race_3)
+race_36<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$race_3)
+race_37<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$race_3)
+race_38<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$race_3)
+race_39<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$race_3)
+race_310<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$race_3)
+
+GMV_race_3_mult<-c(race_3_om$statistic, race_3_om$p.value, race_31$p.value, race_32$p.value, race_33$p.value, race_34$p.value,
+                   race_35$p.value, race_36$p.value,
+                  race_37$p.value, race_38$p.value, race_39$p.value, race_310$p.value)
+
+site_om<- chisq.test(all_GMV_data$anova_group, all_GMV_data$site_id)
+site_id1<-chisq.test(matchH_avg$anova_group, matchH_avg$site_id)
+site_id2<-chisq.test(matchL_avg$anova_group, matchL_avg$site_id)
+site_id3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$site_id)
+site_id4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$site_id)
+site_id5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$site_id)
+site_id6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$site_id)
+site_id7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$site_id)
+site_id8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$site_id)
+site_id9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$site_id)
+site_id10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$site_id)
+
+GMV_site_id_mult<-c(site_om$statistic, site_om$p.value, site_id1$p.value, site_id2$p.value, site_id3$p.value, site_id4$p.value,
+                    site_id5$p.value, site_id6$p.value,
+                  site_id7$p.value, site_id8$p.value, site_id9$p.value, site_id10$p.value)
+```
+
+WMV:
+```{r}
+matchH_avg<-filter(all_WMV_data, anova_group %in% c("avg", "match_high"))
+matchL_avg<-filter(all_WMV_data, anova_group %in% c("avg", "match_low"))
+tailsH_avg<-filter(all_WMV_data, anova_group %in% c("avg", "tails_high"))
+tailsL_avg<-filter(all_WMV_data, anova_group %in% c("avg", "tails_low"))
+matchH_matchL<-filter(all_WMV_data, anova_group %in% c("match_high", "match_low"))
+matchH_tailsH<-filter(all_WMV_data, anova_group %in% c("match_high", "tails_high"))
+tailsL_matchH<-filter(all_WMV_data, anova_group %in% c("tails_low", "match_high"))
+tailsH_matchL<-filter(all_WMV_data, anova_group %in% c("match_low", "tails_high"))
+tailsL_matchL<-filter(all_WMV_data, anova_group %in% c("tails_low", "match_low"))
+tailsL_tailsH<-filter(all_WMV_data, anova_group %in% c("tails_low", "tails_high"))
+
+sex_om<- chisq.test(all_WMV_data$anova_group, all_WMV_data$sex)
+sex1<-chisq.test(matchH_avg$anova_group, matchH_avg$sex)
+sex2<-chisq.test(matchL_avg$anova_group, matchL_avg$sex)
+sex3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$sex)
+sex4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$sex)
+sex5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$sex)
+sex6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$sex)
+sex7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$sex)
+sex8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$sex)
+sex9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$sex)
+sex10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$sex)
+
+WMV_sex_mult<-c(sex_om$statistic, sex_om$p.value, sex1$p.value, sex2$p.value, sex3$p.value, sex4$p.value, sex5$p.value, sex6$p.value,
+                sex7$p.value, sex8$p.value, sex9$p.value, sex10$p.value)
+
+ethnicity_om<- chisq.test(all_WMV_data$anova_group, all_WMV_data$ethnicity)
+ethnicity1<-chisq.test(matchH_avg$anova_group, matchH_avg$ethnicity)
+ethnicity2<-chisq.test(matchL_avg$anova_group, matchL_avg$ethnicity)
+ethnicity3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$ethnicity)
+ethnicity4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$ethnicity)
+ethnicity5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$ethnicity)
+ethnicity6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$ethnicity)
+ethnicity7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$ethnicity)
+ethnicity8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$ethnicity)
+ethnicity9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$ethnicity)
+ethnicity10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$ethnicity)
+
+WMV_ethnicity_mult<-c(ethnicity_om$statistic, ethnicity_om$p.value, 
+                      ethnicity1$p.value, ethnicity2$p.value, ethnicity3$p.value, ethnicity4$p.value, ethnicity5$p.value, ethnicity6$p.value,
+                  ethnicity7$p.value, ethnicity8$p.value, ethnicity9$p.value, ethnicity10$p.value)
+
+race_3_om<- chisq.test(all_WMV_data$anova_group, all_WMV_data$race_3)
+race_31<-chisq.test(matchH_avg$anova_group, matchH_avg$race_3)
+race_32<-chisq.test(matchL_avg$anova_group, matchL_avg$race_3)
+race_33<-chisq.test(tailsH_avg$anova_group, tailsH_avg$race_3)
+race_34<-chisq.test(tailsL_avg$anova_group, tailsL_avg$race_3)
+race_35<-chisq.test(matchH_matchL$anova_group, matchH_matchL$race_3)
+race_36<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$race_3)
+race_37<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$race_3)
+race_38<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$race_3)
+race_39<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$race_3)
+race_310<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$race_3)
+
+WMV_race_3_mult<-c(race_3_om$statistic, race_3_om$p.value, race_31$p.value, race_32$p.value, race_33$p.value, race_34$p.value,
+                   race_35$p.value, race_36$p.value,
+                  race_37$p.value, race_38$p.value, race_39$p.value, race_310$p.value)
+
+site_om<- chisq.test(all_WMV_data$anova_group, all_WMV_data$site_id)
+site_id1<-chisq.test(matchH_avg$anova_group, matchH_avg$site_id)
+site_id2<-chisq.test(matchL_avg$anova_group, matchL_avg$site_id)
+site_id3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$site_id)
+site_id4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$site_id)
+site_id5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$site_id)
+site_id6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$site_id)
+site_id7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$site_id)
+site_id8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$site_id)
+site_id9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$site_id)
+site_id10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$site_id)
+
+WMV_site_id_mult<-c(site_om$statistic, site_om$p.value, site_id1$p.value, site_id2$p.value, site_id3$p.value, site_id4$p.value,
+                    site_id5$p.value, site_id6$p.value,
+                  site_id7$p.value, site_id8$p.value, site_id9$p.value, site_id10$p.value)
+```
+
+sGMV:
+```{r}
+matchH_avg<-filter(all_sGMV_data, anova_group %in% c("avg", "match_high"))
+matchL_avg<-filter(all_sGMV_data, anova_group %in% c("avg", "match_low"))
+tailsH_avg<-filter(all_sGMV_data, anova_group %in% c("avg", "tails_high"))
+tailsL_avg<-filter(all_sGMV_data, anova_group %in% c("avg", "tails_low"))
+matchH_matchL<-filter(all_sGMV_data, anova_group %in% c("match_high", "match_low"))
+matchH_tailsH<-filter(all_sGMV_data, anova_group %in% c("match_high", "tails_high"))
+tailsL_matchH<-filter(all_sGMV_data, anova_group %in% c("tails_low", "match_high"))
+tailsH_matchL<-filter(all_sGMV_data, anova_group %in% c("match_low", "tails_high"))
+tailsL_matchL<-filter(all_sGMV_data, anova_group %in% c("tails_low", "match_low"))
+tailsL_tailsH<-filter(all_sGMV_data, anova_group %in% c("tails_low", "tails_high"))
+
+sex_om<- chisq.test(all_sGMV_data$anova_group, all_sGMV_data$sex)
+sex1<-chisq.test(matchH_avg$anova_group, matchH_avg$sex)
+sex2<-chisq.test(matchL_avg$anova_group, matchL_avg$sex)
+sex3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$sex)
+sex4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$sex)
+sex5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$sex)
+sex6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$sex)
+sex7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$sex)
+sex8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$sex)
+sex9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$sex)
+sex10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$sex)
+
+sGMV_sex_mult<-c(sex_om$statistic, sex_om$p.value, sex1$p.value, sex2$p.value, sex3$p.value, sex4$p.value, sex5$p.value, sex6$p.value,
+                sex7$p.value, sex8$p.value, sex9$p.value, sex10$p.value)
+
+ethnicity_om<- chisq.test(all_sGMV_data$anova_group, all_sGMV_data$ethnicity)
+ethnicity1<-chisq.test(matchH_avg$anova_group, matchH_avg$ethnicity)
+ethnicity2<-chisq.test(matchL_avg$anova_group, matchL_avg$ethnicity)
+ethnicity3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$ethnicity)
+ethnicity4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$ethnicity)
+ethnicity5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$ethnicity)
+ethnicity6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$ethnicity)
+ethnicity7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$ethnicity)
+ethnicity8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$ethnicity)
+ethnicity9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$ethnicity)
+ethnicity10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$ethnicity)
+
+sGMV_ethnicity_mult<-c(ethnicity_om$statistic, ethnicity_om$p.value, 
+                      ethnicity1$p.value, ethnicity2$p.value, ethnicity3$p.value, ethnicity4$p.value, ethnicity5$p.value, ethnicity6$p.value,
+                  ethnicity7$p.value, ethnicity8$p.value, ethnicity9$p.value, ethnicity10$p.value)
+
+race_3_om<- chisq.test(all_sGMV_data$anova_group, all_sGMV_data$race_3)
+race_31<-chisq.test(matchH_avg$anova_group, matchH_avg$race_3)
+race_32<-chisq.test(matchL_avg$anova_group, matchL_avg$race_3)
+race_33<-chisq.test(tailsH_avg$anova_group, tailsH_avg$race_3)
+race_34<-chisq.test(tailsL_avg$anova_group, tailsL_avg$race_3)
+race_35<-chisq.test(matchH_matchL$anova_group, matchH_matchL$race_3)
+race_36<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$race_3)
+race_37<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$race_3)
+race_38<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$race_3)
+race_39<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$race_3)
+race_310<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$race_3)
+
+sGMV_race_3_mult<-c(race_3_om$statistic, race_3_om$p.value, race_31$p.value, race_32$p.value, race_33$p.value, race_34$p.value,
+                   race_35$p.value, race_36$p.value,
+                  race_37$p.value, race_38$p.value, race_39$p.value, race_310$p.value)
+
+site_om<- chisq.test(all_sGMV_data$anova_group, all_sGMV_data$site_id)
+site_id1<-chisq.test(matchH_avg$anova_group, matchH_avg$site_id)
+site_id2<-chisq.test(matchL_avg$anova_group, matchL_avg$site_id)
+site_id3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$site_id)
+site_id4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$site_id)
+site_id5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$site_id)
+site_id6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$site_id)
+site_id7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$site_id)
+site_id8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$site_id)
+site_id9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$site_id)
+site_id10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$site_id)
+
+sGMV_site_id_mult<-c(site_om$statistic, site_om$p.value, site_id1$p.value, site_id2$p.value, site_id3$p.value, site_id4$p.value,
+                    site_id5$p.value, site_id6$p.value,
+                  site_id7$p.value, site_id8$p.value, site_id9$p.value, site_id10$p.value)
+```
+
+vent:
+```{r}
+matchH_avg<-filter(all_vent_data, anova_group %in% c("avg", "match_high"))
+matchL_avg<-filter(all_vent_data, anova_group %in% c("avg", "match_low"))
+tailsH_avg<-filter(all_vent_data, anova_group %in% c("avg", "tails_high"))
+tailsL_avg<-filter(all_vent_data, anova_group %in% c("avg", "tails_low"))
+matchH_matchL<-filter(all_vent_data, anova_group %in% c("match_high", "match_low"))
+matchH_tailsH<-filter(all_vent_data, anova_group %in% c("match_high", "tails_high"))
+tailsL_matchH<-filter(all_vent_data, anova_group %in% c("tails_low", "match_high"))
+tailsH_matchL<-filter(all_vent_data, anova_group %in% c("match_low", "tails_high"))
+tailsL_matchL<-filter(all_vent_data, anova_group %in% c("tails_low", "match_low"))
+tailsL_tailsH<-filter(all_vent_data, anova_group %in% c("tails_low", "tails_high"))
+
+sex_om<- chisq.test(all_vent_data$anova_group, all_vent_data$sex)
+sex1<-chisq.test(matchH_avg$anova_group, matchH_avg$sex)
+sex2<-chisq.test(matchL_avg$anova_group, matchL_avg$sex)
+sex3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$sex)
+sex4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$sex)
+sex5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$sex)
+sex6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$sex)
+sex7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$sex)
+sex8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$sex)
+sex9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$sex)
+sex10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$sex)
+
+vent_sex_mult<-c(sex_om$statistic, sex_om$p.value, sex1$p.value, sex2$p.value, sex3$p.value, sex4$p.value, sex5$p.value, sex6$p.value,
+                sex7$p.value, sex8$p.value, sex9$p.value, sex10$p.value)
+
+ethnicity_om<- chisq.test(all_vent_data$anova_group, all_vent_data$ethnicity)
+ethnicity1<-chisq.test(matchH_avg$anova_group, matchH_avg$ethnicity)
+ethnicity2<-chisq.test(matchL_avg$anova_group, matchL_avg$ethnicity)
+ethnicity3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$ethnicity)
+ethnicity4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$ethnicity)
+ethnicity5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$ethnicity)
+ethnicity6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$ethnicity)
+ethnicity7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$ethnicity)
+ethnicity8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$ethnicity)
+ethnicity9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$ethnicity)
+ethnicity10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$ethnicity)
+
+vent_ethnicity_mult<-c(ethnicity_om$statistic, ethnicity_om$p.value, 
+                      ethnicity1$p.value, ethnicity2$p.value, ethnicity3$p.value, ethnicity4$p.value, ethnicity5$p.value, ethnicity6$p.value,
+                  ethnicity7$p.value, ethnicity8$p.value, ethnicity9$p.value, ethnicity10$p.value)
+
+race_3_om<- chisq.test(all_vent_data$anova_group, all_vent_data$race_3)
+race_31<-chisq.test(matchH_avg$anova_group, matchH_avg$race_3)
+race_32<-chisq.test(matchL_avg$anova_group, matchL_avg$race_3)
+race_33<-chisq.test(tailsH_avg$anova_group, tailsH_avg$race_3)
+race_34<-chisq.test(tailsL_avg$anova_group, tailsL_avg$race_3)
+race_35<-chisq.test(matchH_matchL$anova_group, matchH_matchL$race_3)
+race_36<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$race_3)
+race_37<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$race_3)
+race_38<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$race_3)
+race_39<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$race_3)
+race_310<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$race_3)
+
+vent_race_3_mult<-c(race_3_om$statistic, race_3_om$p.value, race_31$p.value, race_32$p.value, race_33$p.value, race_34$p.value,
+                   race_35$p.value, race_36$p.value,
+                  race_37$p.value, race_38$p.value, race_39$p.value, race_310$p.value)
+
+site_om<- chisq.test(all_vent_data$anova_group, all_vent_data$site_id)
+site_id1<-chisq.test(matchH_avg$anova_group, matchH_avg$site_id)
+site_id2<-chisq.test(matchL_avg$anova_group, matchL_avg$site_id)
+site_id3<-chisq.test(tailsH_avg$anova_group, tailsH_avg$site_id)
+site_id4<-chisq.test(tailsL_avg$anova_group, tailsL_avg$site_id)
+site_id5<-chisq.test(matchH_matchL$anova_group, matchH_matchL$site_id)
+site_id6<-chisq.test(matchH_tailsH$anova_group, matchH_tailsH$site_id)
+site_id7<-chisq.test(tailsL_matchH$anova_group, tailsL_matchH$site_id)
+site_id8<-chisq.test(tailsH_matchL$anova_group, tailsH_matchL$site_id)
+site_id9<-chisq.test(tailsL_matchL$anova_group, tailsL_matchL$site_id)
+site_id10<-chisq.test(tailsL_tailsH$anova_group, tailsL_tailsH$site_id)
+
+vent_site_id_mult<-c(site_om$statistic, site_om$p.value, site_id1$p.value, site_id2$p.value, site_id3$p.value, site_id4$p.value,
+                    site_id5$p.value, site_id6$p.value,
+                  site_id7$p.value, site_id8$p.value, site_id9$p.value, site_id10$p.value)
+```
+
+Put them together 
+```{r}
+GMV_mult<- data.frame(rbind(GMV_sex_mult, GMV_ethnicity_mult, GMV_race_3_mult, GMV_site_id_mult))
+WMV_mult<- data.frame(rbind(WMV_sex_mult, WMV_ethnicity_mult, WMV_race_3_mult, WMV_site_id_mult))
+sGMV_mult<- data.frame(rbind(sGMV_sex_mult, sGMV_ethnicity_mult, sGMV_race_3_mult, sGMV_site_id_mult))
+vent_mult<- data.frame(rbind(vent_sex_mult, vent_ethnicity_mult, vent_race_3_mult, vent_site_id_mult))
+```
+
+NOW do it with centered data: 
+```{r}
+centered_GMV_data<- all_GMV_data%>%
+  mutate(c_GMV = GMV - mean(GMV, na.rm=T))%>%
+  mutate(c_WMV = WMV - mean(WMV, na.rm=T))%>%
+  mutate(c_sGMV = sGMV - mean(sGMV, na.rm=T))%>%
+  mutate(c_vent = Ventricles - mean(Ventricles, na.rm=T))%>%
+  mutate(c_age = age - mean(age, na.rm=T))%>%
+  mutate(c_income = combined_income - mean(combined_income, na.rm=T))%>%
+  mutate(c_education = parent_education - mean(parent_education, na.rm=T))%>%
+  mutate(c_euler = euler - mean(euler, na.rm=T))%>%
+  mutate(c_puberty = puberty_stage - mean(puberty_stage, na.rm=T))%>%
+  select(starts_with(c('subjectkey', 'c_', 'anova_group')))
+
+centered_WMV_data<- all_WMV_data%>%
+  mutate(c_GMV = GMV - mean(GMV, na.rm=T))%>%
+  mutate(c_WMV = WMV - mean(WMV, na.rm=T))%>%
+  mutate(c_sGMV = sGMV - mean(sGMV, na.rm=T))%>%
+  mutate(c_vent = Ventricles - mean(Ventricles, na.rm=T))%>%
+  mutate(c_age = age - mean(age, na.rm=T))%>%
+  mutate(c_income = combined_income - mean(combined_income, na.rm=T))%>%
+  mutate(c_education = parent_education - mean(parent_education, na.rm=T))%>%
+  mutate(c_euler = euler - mean(euler, na.rm=T))%>%
+  mutate(c_puberty = puberty_stage - mean(puberty_stage, na.rm=T))%>%
+  select(starts_with(c('subjectkey', 'c_', 'anova_group')))
+
+centered_sGMV_data<- all_sGMV_data%>%
+  mutate(c_GMV = GMV - mean(GMV, na.rm=T))%>%
+  mutate(c_WMV = WMV - mean(WMV, na.rm=T))%>%
+  mutate(c_sGMV = sGMV - mean(sGMV, na.rm=T))%>%
+  mutate(c_vent = Ventricles - mean(Ventricles, na.rm=T))%>%
+  mutate(c_age = age - mean(age, na.rm=T))%>%
+  mutate(c_income = combined_income - mean(combined_income, na.rm=T))%>%
+  mutate(c_education = parent_education - mean(parent_education, na.rm=T))%>%
+  mutate(c_euler = euler - mean(euler, na.rm=T))%>%
+  mutate(c_puberty = puberty_stage - mean(puberty_stage, na.rm=T))%>%
+  select(starts_with(c('subjectkey', 'c_', 'anova_group')))
+
+centered_vent_data<- all_vent_data%>%
+  mutate(c_GMV = GMV - mean(GMV, na.rm=T))%>%
+  mutate(c_WMV = WMV - mean(WMV, na.rm=T))%>%
+  mutate(c_sGMV = sGMV - mean(sGMV, na.rm=T))%>%
+  mutate(c_vent = Ventricles - mean(Ventricles, na.rm=T))%>%
+  mutate(c_age = age - mean(age, na.rm=T))%>%
+  mutate(c_income = combined_income - mean(combined_income, na.rm=T))%>%
+  mutate(c_education = parent_education - mean(parent_education, na.rm=T))%>%
+  mutate(c_euler = euler - mean(euler, na.rm=T))%>%
+  mutate(c_puberty = puberty_stage - mean(puberty_stage, na.rm=T))%>%
+  select(starts_with(c('subjectkey', 'c_', 'anova_group')))
+```
+
+new v's
+```{r}
+centered_vs<- c('c_GMV', 'c_WMV', 'c_sGMV', 'c_vent', 'c_age', 'c_income', 'c_education', 'c_euler', 'c_puberty')
+
+```
+
+Run ANOVA functions
+```{r}
+c_GMV_anova_results <- run_anova_tests(centered_GMV_data, centered_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+c_WMV_anova_results <- run_anova_tests(centered_WMV_data, centered_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+c_sGMV_anova_results <- run_anova_tests(centered_sGMV_data, centered_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+c_vent_anova_results <- run_anova_tests(centered_vent_data, centered_vs, "anova_group")%>%
+  pivot_wider(names_from=Comparison, values_from=Pairwise_P_Value)
+```
+
+HTML:
+```{r}
+c_GMV_anova_results%>% kable(format = "html")
+c_WMV_anova_results%>% kable(format = "html")
+c_sGMV_anova_results%>% kable(format = "html")
+c_vent_anova_results%>% kable(format = "html")
+```
+```{r}
+anova(c)
+```

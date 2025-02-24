@@ -1,0 +1,1269 @@
+---
+title: "Topography Matching Notebook Step 2"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R Notebook runs multivariate multiple regression to model the effects of regional GMV on cognitive outcomes using dimensional, tail sampled, and propensity matched modeling strategies. 
+
+-----------------------------------
+Set Up
+-----------------------------------
+```{r}
+set.seed(12345)
+```
+
+First, install necessary packages.
+
+```{r}
+library(MatchIt)
+library(boxr)
+library(tidyr)
+library(dplyr)
+library(cobalt)
+library(ggplot2)
+library(finalfit)
+library(Hmisc)
+library(lm.beta)
+library(ggpubr)
+library(bayesbio)
+library(viridis)
+library(ggExtra)
+library(dichromat)
+library(lavaan)
+library(dplyr)
+library(stringr)
+```
+
+Specify color palette
+
+```{r}
+custom_colors <- colorRampPalette(c("blue","darkturquoise","white", "yellow", "red"))
+```
+
+Specify that select function should be pulled from dplyr
+
+```{r}
+select <- dplyr::select
+recode <- dplyr::recode
+rename <- dplyr::rename
+mutate <- dplyr::mutate
+revalue <- plyr::revalue
+```
+
+Next, log into PennBox, and set working directory the ABCD directory.
+
+```{r}
+box_auth()
+
+box_setwd('167848222541')
+```
+
+Load in matched network data:
+```{r}
+GMV_test_data<-box_read('1438677748369', fread=TRUE)
+```
+
+Now, we will add in additional data to see if our groups differ meaningfully on cognitive outcomes.
+
+Read in Cognitive Data 
+```{r}
+cog_data<-box_read('1022619576971', fread=TRUE)
+cog_data<-as_tibble(cog_data)%>%
+  slice(2:n()) %>% #drop the first row, which contains the variable definitions
+  dplyr::select(-collection_id,-abcd_tbss01_id,-dataset_id,-interview_date) %>% 
+  dplyr::select_if(~!(all(is.na(.)) | all(. == ""))) %>% #get rid of totally empty columns
+  mutate(across(everything(), ~ifelse(.=="", NA, as.character(.)))) #recode blank rows as "NA" 
+
+cog_data_short<- cog_data %>%
+  dplyr::select(ends_with(c("subjectkey", "eventname", "uncorrected")))%>%
+  filter(eventname=='baseline_year_1_arm_1')
+```
+
+And read in regional data, make a list of all the predictor names: 
+```{r}
+regional_data<- box_read('1558667085128', fread=TRUE)
+regional_data$participant<-gsub('sub-NDARINV','NDAR_INV',regional_data$participant)
+
+regional_predictors<- colnames(regional_data)[4:71]
+```
+
+and merge into data:
+```{r}
+GMV_test_data<- merge(GMV_test_data, cog_data_short, by='subjectkey')%>%
+  mutate_at(vars(-c("subjectkey", "subclass", "distance", "weights")),as.numeric)
+GMV_test_data<- merge(GMV_test_data, regional_data, by.x='subjectkey', by.y='participant')
+```
+
+```{r}
+psych::describe(GMV_test_data)
+```
+
+Now load in unmatched network data: 
+```{r}
+unmatched_GMV_data<-box_read('1438648430018', fread=TRUE)
+```
+
+and merge into data:
+```{r}
+GMV_test_data2<- merge(unmatched_GMV_data, cog_data_short, by='subjectkey')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+GMV_test_data2<- merge(GMV_test_data2, regional_data, by.x='subjectkey', by.y='participant')
+```
+
+```{r}
+psych::describe(GMV_test_data2)
+```
+
+Load in dimensional network data, merge: 
+```{r}
+all_dimensional_data<-box_read('1438646812672', fread=TRUE)
+
+all_dimensional_data<- merge(all_dimensional_data, cog_data_short, by='subjectkey')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+all_dimensional_data<- merge(all_dimensional_data, regional_data, by.x='subjectkey', by.y='participant')
+```
+
+```{r}
+psych::describe(all_dimensional_data)
+```
+
+-----------------------------------
+Specify Models, Functions
+-----------------------------------
+
+Write out a template for our dependent variables: 
+```{r}
+model_template<- 
+'
+nihtbx_picvocab_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_flanker_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_list_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_cardsort_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_pattern_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_picture_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_reading_uncorrected ~ {predictor} + age + sex.x + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+nihtbx_picvocab_uncorrected ~~ nihtbx_flanker_uncorrected
+nihtbx_picvocab_uncorrected ~~ nihtbx_list_uncorrected
+nihtbx_picvocab_uncorrected ~~ nihtbx_cardsort_uncorrected
+nihtbx_picvocab_uncorrected ~~ nihtbx_pattern_uncorrected
+nihtbx_picvocab_uncorrected ~~ nihtbx_picture_uncorrected
+nihtbx_picvocab_uncorrected ~~ nihtbx_reading_uncorrected
+nihtbx_flanker_uncorrected ~~ nihtbx_list_uncorrected
+nihtbx_flanker_uncorrected ~~ nihtbx_cardsort_uncorrected
+nihtbx_flanker_uncorrected ~~ nihtbx_pattern_uncorrected
+nihtbx_flanker_uncorrected ~~ nihtbx_picture_uncorrected
+nihtbx_flanker_uncorrected ~~ nihtbx_reading_uncorrected
+nihtbx_list_uncorrected ~~ nihtbx_cardsort_uncorrected
+nihtbx_list_uncorrected ~~ nihtbx_pattern_uncorrected
+nihtbx_list_uncorrected ~~ nihtbx_picture_uncorrected
+nihtbx_list_uncorrected ~~ nihtbx_reading_uncorrected
+nihtbx_cardsort_uncorrected ~~ nihtbx_pattern_uncorrected
+nihtbx_cardsort_uncorrected ~~ nihtbx_picture_uncorrected
+nihtbx_cardsort_uncorrected ~~ nihtbx_reading_uncorrected
+nihtbx_pattern_uncorrected ~~ nihtbx_picture_uncorrected
+nihtbx_pattern_uncorrected ~~ nihtbx_reading_uncorrected
+nihtbx_picture_uncorrected ~~ nihtbx_reading_uncorrected
+'
+```
+
+Fit model with each of 68 predictors in matched data: 
+```{r}
+fit_model <- function(predictor) {
+  model <- gsub("\\{predictor\\}", predictor, model_template)
+  fit <- sem(model, data = GMV_test_data)
+  estimates <- parameterEstimates(fit, standardized = TRUE)
+  results <- estimates %>%
+    filter(op == "~" & lhs %in% c("nihtbx_picvocab_uncorrected",
+                                  "nihtbx_flanker_uncorrected", 
+                                  "nihtbx_list_uncorrected", 
+                                  "nihtbx_cardsort_uncorrected", 
+                                  "nihtbx_pattern_uncorrected", 
+                                  "nihtbx_picture_uncorrected", 
+                                  "nihtbx_reading_uncorrected") & rhs %in% c(predictor, 'age', 'sex.x', 'site_id', 'puberty_stage',
+                                                                             'ethnicity', 'race_3', 'parent_education', 
+                                                                             'combined_income')) %>%
+    select(lhs, rhs, est, se, std.all, pvalue) %>%
+    rename(dependent = lhs, 
+           beta = std.all, 
+           p.value = pvalue)%>%
+    mutate(predictor = rep(c(predictor, 'age', 'sex', 'site', 'puberty','ethnicity', 'race', 'parent_education', 'combined_income'),
+                           length.out = n()))
+  
+    return(results)
+}
+```
+
+Fit model with each of 68 predictors in tail sampled data: 
+```{r}
+fit_model2 <- function(predictor) {
+  model <- gsub("\\{predictor\\}", predictor, model_template)
+  fit <- sem(model, data = GMV_test_data2)
+  estimates <- parameterEstimates(fit, standardized = TRUE)
+  results <- estimates %>%
+    filter(op == "~" & lhs %in% c("nihtbx_picvocab_uncorrected",
+                                  "nihtbx_flanker_uncorrected", 
+                                  "nihtbx_list_uncorrected", 
+                                  "nihtbx_cardsort_uncorrected", 
+                                  "nihtbx_pattern_uncorrected", 
+                                  "nihtbx_picture_uncorrected", 
+                                  "nihtbx_reading_uncorrected") & rhs %in% c(predictor, 'age', 'sex.x', 'site_id', 'puberty_stage',
+                                                                             'ethnicity', 'race_3', 'parent_education', 
+                                                                             'combined_income')) %>%
+    select(lhs, rhs, est, se, std.all, pvalue) %>%
+    rename(dependent = lhs, 
+           beta = std.all, 
+           p.value = pvalue)%>%
+    mutate(predictor = rep(c(predictor, 'age', 'sex', 'site', 'puberty','ethnicity', 'race', 'parent_education', 'combined_income'),
+                           length.out = n()))
+  
+    return(results)
+}
+```
+
+Fit model with each of 68 predictors in dimensional data: 
+```{r}
+fit_model3 <- function(predictor) {
+  model <- gsub("\\{predictor\\}", predictor, model_template)
+  fit <- sem(model, data = all_dimensional_data)
+  estimates <- parameterEstimates(fit, standardized = TRUE)
+  results <- estimates %>%
+    filter(op == "~" & lhs %in% c("nihtbx_picvocab_uncorrected",
+                                  "nihtbx_flanker_uncorrected", 
+                                  "nihtbx_list_uncorrected", 
+                                  "nihtbx_cardsort_uncorrected", 
+                                  "nihtbx_pattern_uncorrected", 
+                                  "nihtbx_picture_uncorrected", 
+                                  "nihtbx_reading_uncorrected") & rhs %in% c(predictor, 'age', 'sex.x', 'site_id', 'puberty_stage',
+                                                                             'ethnicity', 'race_3', 'parent_education', 
+                                                                             'combined_income')) %>%
+    select(lhs, rhs, est, se, std.all, pvalue) %>%
+    rename(dependent = lhs, 
+           beta = std.all, 
+           p.value = pvalue)%>%
+    mutate(predictor = rep(c(predictor, 'age', 'sex', 'site', 'puberty','ethnicity', 'race', 'parent_education', 'combined_income'),
+                           length.out = n()))
+  
+    return(results)
+}
+```
+
+-----------------------------------
+Evaluate Fit
+-----------------------------------
+
+Matched data: 
+```{r}
+results <- lapply(regional_predictors, fit_model) %>% bind_rows()
+```
+
+FDR correct: 
+```{r}
+results<- results%>%
+   mutate(ps_fdr= (p.adjust.nlp(p.value, method='fdr', n=612)))
+```
+
+Tail sampled data: 
+```{r}
+results2 <- lapply(regional_predictors, fit_model2) %>% bind_rows()
+```
+
+FDR correct: 
+```{r}
+results2<- results2%>%
+   mutate(ps_fdr= (p.adjust.nlp(p.value, method='fdr', n=612)))
+```
+
+Dimensional Data: 
+```{r}
+results3 <- lapply(regional_predictors, fit_model3) %>% bind_rows()
+```
+
+FDR correct: 
+```{r}
+results3<- results3%>%
+   mutate(ps_fdr= (p.adjust.nlp(p.value, method='fdr', n=612)))
+```
+
+
+-----------------------------------
+Format Results
+-----------------------------------
+
+Format matched data: 
+```{r}
+#add significance
+results_html<- results %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+results_html$formatted_raw_est <- paste0(round(results_html$est,2), ", (", round(results_html$se,2), ")")
+results_html$formatted_std_est <- paste0(round(results_html$beta,2), results_html$significance)
+
+results_html <- results_html %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)
+
+#rename v's
+results_html$dependent<- (factor(results_html$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results_html$predictor<-gsub('Transformed.q.wre','',results_html$predictor)
+
+results_html$predictor<- revalue(results_html$predictor, c("rh.GM.bankssts" = "Right Banks of the superior temporal sulcus", 
+                                                 "rh.GM.caudalanteriorcingulate" = "Right Caudal anterior cingulate cortex", 
+                                                 "rh.GM.caudalmiddlefrontal" = "Right Caudal middle frontal gyrus", 
+                                                 "rh.GM.cuneus" = "Right Cuneus cortex", 
+                                                 "rh.GM.entorhinal" = "Right Entorhinal cortex", 
+                                                 "rh.GM.fusiform" = "Right Fusiform gyrus", 
+                                                 "rh.GM.inferiorparietal" = "Right Inferior parietal cortex", 
+                                                 "rh.GM.inferiortemporal" = "Right Inferior temporal gyrus",
+                                                 "rh.GM.isthmuscingulate" = "Right Isthmus Anterior Cingulate cortex", 
+                                                 "rh.GM.lateraloccipital" = "Right Lateral occipital cortex", 
+                                                 "rh.GM.lateralorbitofrontal" = "Right Lateral Orbitofrontal cortex", 
+                                                 "rh.GM.lingual" = "Right Lingual gyrus", 
+                                                 "rh.GM.medialorbitofrontal" = "Right Medial Orbitofrontal cortex", 
+                                                 "rh.GM.middletemporal" = "Right Middle temporal gyrus", 
+                                                 "rh.GM.parahippocampal" = "Right Parahippocampal gyrus", 
+                                                 "rh.GM.paracentral" = "Right Paracentral lobule", 
+                                                 "rh.GM.parsopercularis" = "Right Pars opercularis", 
+                                                 "rh.GM.parsorbitalis" = "Right Pars orbitalis", 
+                                                 "rh.GM.parstriangularis" = "Right Pars triangularis", 
+                                                 "rh.GM.pericalcarine" = "Right Pericalcarine cortex", 
+                                                 "rh.GM.postcentral" = "Right Postcentral gyrus", 
+                                                 "rh.GM.posteriorcingulate" = "Right Posterior anterior cingulate cortex", 
+                                                 "rh.GM.precentral" = "Right Precentral gyrus", 
+                                                 "rh.GM.precuneus" = "Right Precuneus cortex", 
+                                                 "rh.GM.rostralanteriorcingulate" = "Right Rostral anterior cingulate cortex", 
+                                                 "rh.GM.rostralmiddlefrontal" = "Right Rostral middle frontal gyrus", 
+                                                 "rh.GM.superiorfrontal" = "Right Superior frontal gyrus", 
+                                                 "rh.GM.superiorparietal" = "Right Superior parietal cortex", 
+                                                 "rh.GM.superiortemporal" = "Right Superior temporal gyrus", 
+                                                 "rh.GM.supramarginal" = "Right Supramarginal gyrus", 
+                                                 "rh.GM.frontalpole" = "Right Frontal pole", 
+                                                 "rh.GM.temporalpole" = "Right Temporal pole", 
+                                                 "rh.GM.transversetemporal" = "Right Transverse temporal cortex", 
+                                                 "rh.GM.insula" = "Right Insula", 
+                                                 "lh.GM.bankssts" = "Left Banks of the superior temporal sulcus", 
+                                                 "lh.GM.caudalanteriorcingulate" = "Left Caudal anterior cingulate cortex", 
+                                                 "lh.GM.caudalmiddlefrontal" = "Left Caudal middle frontal gyrus", 
+                                                 "lh.GM.cuneus" = "Left Cuneus cortex", 
+                                                 "lh.GM.entorhinal" = "Left Entorhinal cortex", 
+                                                 "lh.GM.fusiform" = "Left Fusiform gyrus", 
+                                                 "lh.GM.inferiorparietal" = "Left Inferior parietal cortex", 
+                                                 "lh.GM.inferiortemporal" = "Left Inferior temporal gyrus",
+                                                 "lh.GM.isthmuscingulate" = "Left Isthmus Anterior Cingulate cortex", 
+                                                 "lh.GM.lateraloccipital" = "Left Lateral occipital cortex", 
+                                                 "lh.GM.lateralorbitofrontal" = "Left Lateral Orbitofrontal cortex", 
+                                                 "lh.GM.lingual" = "Left Lingual gyrus", 
+                                                 "lh.GM.medialorbitofrontal" = "Left Medial Orbitofrontal cortex", 
+                                                 "lh.GM.middletemporal" = "Left Middle temporal gyrus", 
+                                                 "lh.GM.parahippocampal" = "Left Parahippocampal gyrus", 
+                                                 "lh.GM.paracentral" = "Left Paracentral lobule", 
+                                                 "lh.GM.parsopercularis" = "Left Pars opercularis", 
+                                                 "lh.GM.parsorbitalis" = "Left Pars orbitalis", 
+                                                 "lh.GM.parstriangularis" = "Left Pars triangularis", 
+                                                 "lh.GM.pericalcarine" = "Left Pericalcarine cortex", 
+                                                 "lh.GM.postcentral" = "Left Postcentral gyrus", 
+                                                 "lh.GM.posteriorcingulate" = "Left Posterior anterior cingulate cortex", 
+                                                 "lh.GM.precentral" = "Left Precentral gyrus", 
+                                                 "lh.GM.precuneus" = "Left Precuneus cortex", 
+                                                 "lh.GM.rostralanteriorcingulate" = "Left Rostral anterior cingulate cortex", 
+                                                 "lh.GM.rostralmiddlefrontal" = "Left Rostral middle frontal gyrus", 
+                                                 "lh.GM.superiorfrontal" = "Left Superior frontal gyrus", 
+                                                 "lh.GM.superiorparietal" = "Left Superior parietal cortex", 
+                                                 "lh.GM.superiortemporal" = "Left Superior temporal gyrus", 
+                                                 "lh.GM.supramarginal" = "Left Supramarginal gyrus", 
+                                                 "lh.GM.frontalpole" = "Left Frontal pole", 
+                                                 "lh.GM.temporalpole" = "Left Temporal pole", 
+                                                 "lh.GM.transversetemporal" = "Left Transverse temporal cortex", 
+                                                 "lh.GM.insula" = "Left Insula"))
+
+#expand cols (by predictor)
+matched_results_html <- results_html %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  group_by(predictor, dependent, Estimate_Type) %>%
+  mutate(dup_id = row_number()) %>%
+  ungroup()%>%
+  pivot_wider(
+    names_from = c(dependent, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_",
+    id_cols = c(predictor, dup_id)
+  ) %>%
+  select(-dup_id)
+
+#create a variable that groups by predictor (ie: model) 
+imaging_predictors <- matched_results_html$predictor[seq(1, length(matched_results_html$predictor), by = 9)]
+matched_results_html$predictor_group <- rep(imaging_predictors, each = 9)
+
+#add hemisphere variable 
+matched_results_html <- matched_results_html %>%
+  mutate(hemisphere = case_when(startsWith(as.character(predictor_group), "Left") ~ "Left", 
+                                startsWith(as.character(predictor_group), "Right") ~ "Right"))%>%
+  mutate(predictor = case_when(startsWith(as.character(predictor), "Left") ~ "Regional Predictor", 
+                               startsWith(as.character(predictor), "Right") ~ "Regional Predictor", 
+                               TRUE ~ predictor))
+
+#Create a formatted regression table 
+matched_regression_table <- matched_results_html %>%
+  mutate(predictor = recode(predictor,"age" = "Age", "sex" = "Sex", "site" = "Site ID", "puberty" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))%>%
+  gt(groupname_col = "predictor_group", rowname_col = "predictor") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using regional cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    nihtbx_picvocab_uncorrected_formatted_raw_est = "Raw", nihtbx_picvocab_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_flanker_uncorrected_formatted_raw_est = "Raw", nihtbx_flanker_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_list_uncorrected_formatted_raw_est = "Raw", nihtbx_list_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_cardsort_uncorrected_formatted_raw_est = "Raw", nihtbx_cardsort_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_pattern_uncorrected_formatted_raw_est = "Raw", nihtbx_pattern_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_picture_uncorrected_formatted_raw_est = "Raw", nihtbx_picture_uncorrected_formatted_std_est = "Standardized", 
+    nihtbx_reading_uncorrected_formatted_raw_est = "Raw", nihtbx_reading_uncorrected_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Language",
+    columns = c(nihtbx_picvocab_uncorrected_formatted_raw_est, nihtbx_picvocab_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Inhibitory Control",
+    columns = c(nihtbx_flanker_uncorrected_formatted_raw_est, nihtbx_flanker_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Cognitive Flexibility",
+    columns = c(nihtbx_list_uncorrected_formatted_raw_est, nihtbx_list_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Working Memory",
+    columns = c(nihtbx_cardsort_uncorrected_formatted_raw_est, nihtbx_cardsort_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Processing Speed",
+    columns = c(nihtbx_pattern_uncorrected_formatted_raw_est, nihtbx_pattern_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Episodic Memory",
+    columns = c(nihtbx_picture_uncorrected_formatted_raw_est, nihtbx_picture_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Reading",
+    columns = c(nihtbx_reading_uncorrected_formatted_raw_est, nihtbx_reading_uncorrected_formatted_std_est)
+  ) %>%
+  row_group_order(groups = unique(combined_html$predictor_group)) # Order models if necessary
+```
+
+Save the table as an HTML file
+```{r}
+matched_regression_table %>%
+  gtsave("cog_regional_matched_table.html")
+```
+
+format results for HTML 
+```{r}
+#add significance
+results_html2<- results2 %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+results_html2$formatted_raw_est <- paste0(round(results_html2$est,2), ", (", round(results_html2$se,2), ")")
+results_html2$formatted_std_est <- paste0(round(results_html2$beta,2), results_html2$significance)
+
+results_html2 <- results_html2 %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)
+
+#rename v's
+results_html2$dependent<- (factor(results_html2$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results_html2$predictor<-gsub('Transformed.q.wre','',results_html2$predictor)
+
+results_html2$predictor<- revalue(results_html2$predictor, c("rh.GM.bankssts" = "Right Banks of the superior temporal sulcus", 
+                                                 "rh.GM.caudalanteriorcingulate" = "Right Caudal anterior cingulate cortex", 
+                                                 "rh.GM.caudalmiddlefrontal" = "Right Caudal middle frontal gyrus", 
+                                                 "rh.GM.cuneus" = "Right Cuneus cortex", 
+                                                 "rh.GM.entorhinal" = "Right Entorhinal cortex", 
+                                                 "rh.GM.fusiform" = "Right Fusiform gyrus", 
+                                                 "rh.GM.inferiorparietal" = "Right Inferior parietal cortex", 
+                                                 "rh.GM.inferiortemporal" = "Right Inferior temporal gyrus",
+                                                 "rh.GM.isthmuscingulate" = "Right Isthmus Anterior Cingulate cortex", 
+                                                 "rh.GM.lateraloccipital" = "Right Lateral occipital cortex", 
+                                                 "rh.GM.lateralorbitofrontal" = "Right Lateral Orbitofrontal cortex", 
+                                                 "rh.GM.lingual" = "Right Lingual gyrus", 
+                                                 "rh.GM.medialorbitofrontal" = "Right Medial Orbitofrontal cortex", 
+                                                 "rh.GM.middletemporal" = "Right Middle temporal gyrus", 
+                                                 "rh.GM.parahippocampal" = "Right Parahippocampal gyrus", 
+                                                 "rh.GM.paracentral" = "Right Paracentral lobule", 
+                                                 "rh.GM.parsopercularis" = "Right Pars opercularis", 
+                                                 "rh.GM.parsorbitalis" = "Right Pars orbitalis", 
+                                                 "rh.GM.parstriangularis" = "Right Pars triangularis", 
+                                                 "rh.GM.pericalcarine" = "Right Pericalcarine cortex", 
+                                                 "rh.GM.postcentral" = "Right Postcentral gyrus", 
+                                                 "rh.GM.posteriorcingulate" = "Right Posterior anterior cingulate cortex", 
+                                                 "rh.GM.precentral" = "Right Precentral gyrus", 
+                                                 "rh.GM.precuneus" = "Right Precuneus cortex", 
+                                                 "rh.GM.rostralanteriorcingulate" = "Right Rostral anterior cingulate cortex", 
+                                                 "rh.GM.rostralmiddlefrontal" = "Right Rostral middle frontal gyrus", 
+                                                 "rh.GM.superiorfrontal" = "Right Superior frontal gyrus", 
+                                                 "rh.GM.superiorparietal" = "Right Superior parietal cortex", 
+                                                 "rh.GM.superiortemporal" = "Right Superior temporal gyrus", 
+                                                 "rh.GM.supramarginal" = "Right Supramarginal gyrus", 
+                                                 "rh.GM.frontalpole" = "Right Frontal pole", 
+                                                 "rh.GM.temporalpole" = "Right Temporal pole", 
+                                                 "rh.GM.transversetemporal" = "Right Transverse temporal cortex", 
+                                                 "rh.GM.insula" = "Right Insula", 
+                                                 "lh.GM.bankssts" = "Left Banks of the superior temporal sulcus", 
+                                                 "lh.GM.caudalanteriorcingulate" = "Left Caudal anterior cingulate cortex", 
+                                                 "lh.GM.caudalmiddlefrontal" = "Left Caudal middle frontal gyrus", 
+                                                 "lh.GM.cuneus" = "Left Cuneus cortex", 
+                                                 "lh.GM.entorhinal" = "Left Entorhinal cortex", 
+                                                 "lh.GM.fusiform" = "Left Fusiform gyrus", 
+                                                 "lh.GM.inferiorparietal" = "Left Inferior parietal cortex", 
+                                                 "lh.GM.inferiortemporal" = "Left Inferior temporal gyrus",
+                                                 "lh.GM.isthmuscingulate" = "Left Isthmus Anterior Cingulate cortex", 
+                                                 "lh.GM.lateraloccipital" = "Left Lateral occipital cortex", 
+                                                 "lh.GM.lateralorbitofrontal" = "Left Lateral Orbitofrontal cortex", 
+                                                 "lh.GM.lingual" = "Left Lingual gyrus", 
+                                                 "lh.GM.medialorbitofrontal" = "Left Medial Orbitofrontal cortex", 
+                                                 "lh.GM.middletemporal" = "Left Middle temporal gyrus", 
+                                                 "lh.GM.parahippocampal" = "Left Parahippocampal gyrus", 
+                                                 "lh.GM.paracentral" = "Left Paracentral lobule", 
+                                                 "lh.GM.parsopercularis" = "Left Pars opercularis", 
+                                                 "lh.GM.parsorbitalis" = "Left Pars orbitalis", 
+                                                 "lh.GM.parstriangularis" = "Left Pars triangularis", 
+                                                 "lh.GM.pericalcarine" = "Left Pericalcarine cortex", 
+                                                 "lh.GM.postcentral" = "Left Postcentral gyrus", 
+                                                 "lh.GM.posteriorcingulate" = "Left Posterior anterior cingulate cortex", 
+                                                 "lh.GM.precentral" = "Left Precentral gyrus", 
+                                                 "lh.GM.precuneus" = "Left Precuneus cortex", 
+                                                 "lh.GM.rostralanteriorcingulate" = "Left Rostral anterior cingulate cortex", 
+                                                 "lh.GM.rostralmiddlefrontal" = "Left Rostral middle frontal gyrus", 
+                                                 "lh.GM.superiorfrontal" = "Left Superior frontal gyrus", 
+                                                 "lh.GM.superiorparietal" = "Left Superior parietal cortex", 
+                                                 "lh.GM.superiortemporal" = "Left Superior temporal gyrus", 
+                                                 "lh.GM.supramarginal" = "Left Supramarginal gyrus", 
+                                                 "lh.GM.frontalpole" = "Left Frontal pole", 
+                                                 "lh.GM.temporalpole" = "Left Temporal pole", 
+                                                 "lh.GM.transversetemporal" = "Left Transverse temporal cortex", 
+                                                 "lh.GM.insula" = "Left Insula"))
+
+#expand cols (by predictor)
+tails_results_html <- results_html2 %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  group_by(predictor, dependent, Estimate_Type) %>%
+  mutate(dup_id = row_number()) %>%
+  ungroup()%>%
+  pivot_wider(
+    names_from = c(dependent, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_",
+    id_cols = c(predictor, dup_id)
+  ) %>%
+  select(-dup_id)
+
+#create a variable that groups by predictor (ie: model) 
+imaging_predictors <- tails_results_html$predictor[seq(1, length(tails_results_html$predictor), by = 9)]
+tails_results_html$predictor_group <- rep(imaging_predictors, each = 9)
+
+#add hemisphere variable 
+tails_results_html <- tails_results_html %>%
+  mutate(hemisphere = case_when(startsWith(as.character(predictor_group), "Left") ~ "Left", 
+                                startsWith(as.character(predictor_group), "Right") ~ "Right"))%>%
+  mutate(predictor = case_when(startsWith(as.character(predictor), "Left") ~ "Regional Predictor", 
+                               startsWith(as.character(predictor), "Right") ~ "Regional Predictor", 
+                               TRUE ~ predictor))
+
+#Create a formatted regression table 
+tails_regression_table <- tails_results_html %>%
+  mutate(predictor = recode(predictor,"age" = "Age", "sex" = "Sex", "site" = "Site ID", "puberty" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))%>%
+  gt(groupname_col = "predictor_group", rowname_col = "predictor") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using regional cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    nihtbx_picvocab_uncorrected_formatted_raw_est = "Raw", nihtbx_picvocab_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_flanker_uncorrected_formatted_raw_est = "Raw", nihtbx_flanker_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_list_uncorrected_formatted_raw_est = "Raw", nihtbx_list_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_cardsort_uncorrected_formatted_raw_est = "Raw", nihtbx_cardsort_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_pattern_uncorrected_formatted_raw_est = "Raw", nihtbx_pattern_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_picture_uncorrected_formatted_raw_est = "Raw", nihtbx_picture_uncorrected_formatted_std_est = "Standardized", 
+    nihtbx_reading_uncorrected_formatted_raw_est = "Raw", nihtbx_reading_uncorrected_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Language",
+    columns = c(nihtbx_picvocab_uncorrected_formatted_raw_est, nihtbx_picvocab_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Inhibitory Control",
+    columns = c(nihtbx_flanker_uncorrected_formatted_raw_est, nihtbx_flanker_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Cognitive Flexibility",
+    columns = c(nihtbx_list_uncorrected_formatted_raw_est, nihtbx_list_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Working Memory",
+    columns = c(nihtbx_cardsort_uncorrected_formatted_raw_est, nihtbx_cardsort_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Processing Speed",
+    columns = c(nihtbx_pattern_uncorrected_formatted_raw_est, nihtbx_pattern_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Episodic Memory",
+    columns = c(nihtbx_picture_uncorrected_formatted_raw_est, nihtbx_picture_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Reading",
+    columns = c(nihtbx_reading_uncorrected_formatted_raw_est, nihtbx_reading_uncorrected_formatted_std_est)
+  ) %>%
+  row_group_order(groups = unique(combined_html$predictor_group)) # Order models if necessary
+```
+
+Save the table as an HTML file
+```{r}
+tails_regression_table %>%
+  gtsave("cog_regional_tails_table.html")
+```
+
+format results for HTML 
+```{r}
+#add significance
+results_html3<- results3 %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+results_html3$formatted_raw_est <- paste0(round(results_html3$est,2), ", (", round(results_html3$se,2), ")")
+results_html3$formatted_std_est <- paste0(round(results_html3$beta,2), results_html3$significance)
+
+results_html3 <- results_html3 %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)
+
+#rename v's
+results_html3$dependent<- (factor(results_html3$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results_html3$predictor<-gsub('Transformed.q.wre','',results_html3$predictor)
+
+results_html3$predictor<- revalue(results_html3$predictor, c("rh.GM.bankssts" = "Right Banks of the superior temporal sulcus", 
+                                                 "rh.GM.caudalanteriorcingulate" = "Right Caudal anterior cingulate cortex", 
+                                                 "rh.GM.caudalmiddlefrontal" = "Right Caudal middle frontal gyrus", 
+                                                 "rh.GM.cuneus" = "Right Cuneus cortex", 
+                                                 "rh.GM.entorhinal" = "Right Entorhinal cortex", 
+                                                 "rh.GM.fusiform" = "Right Fusiform gyrus", 
+                                                 "rh.GM.inferiorparietal" = "Right Inferior parietal cortex", 
+                                                 "rh.GM.inferiortemporal" = "Right Inferior temporal gyrus",
+                                                 "rh.GM.isthmuscingulate" = "Right Isthmus Anterior Cingulate cortex", 
+                                                 "rh.GM.lateraloccipital" = "Right Lateral occipital cortex", 
+                                                 "rh.GM.lateralorbitofrontal" = "Right Lateral Orbitofrontal cortex", 
+                                                 "rh.GM.lingual" = "Right Lingual gyrus", 
+                                                 "rh.GM.medialorbitofrontal" = "Right Medial Orbitofrontal cortex", 
+                                                 "rh.GM.middletemporal" = "Right Middle temporal gyrus", 
+                                                 "rh.GM.parahippocampal" = "Right Parahippocampal gyrus", 
+                                                 "rh.GM.paracentral" = "Right Paracentral lobule", 
+                                                 "rh.GM.parsopercularis" = "Right Pars opercularis", 
+                                                 "rh.GM.parsorbitalis" = "Right Pars orbitalis", 
+                                                 "rh.GM.parstriangularis" = "Right Pars triangularis", 
+                                                 "rh.GM.pericalcarine" = "Right Pericalcarine cortex", 
+                                                 "rh.GM.postcentral" = "Right Postcentral gyrus", 
+                                                 "rh.GM.posteriorcingulate" = "Right Posterior anterior cingulate cortex", 
+                                                 "rh.GM.precentral" = "Right Precentral gyrus", 
+                                                 "rh.GM.precuneus" = "Right Precuneus cortex", 
+                                                 "rh.GM.rostralanteriorcingulate" = "Right Rostral anterior cingulate cortex", 
+                                                 "rh.GM.rostralmiddlefrontal" = "Right Rostral middle frontal gyrus", 
+                                                 "rh.GM.superiorfrontal" = "Right Superior frontal gyrus", 
+                                                 "rh.GM.superiorparietal" = "Right Superior parietal cortex", 
+                                                 "rh.GM.superiortemporal" = "Right Superior temporal gyrus", 
+                                                 "rh.GM.supramarginal" = "Right Supramarginal gyrus", 
+                                                 "rh.GM.frontalpole" = "Right Frontal pole", 
+                                                 "rh.GM.temporalpole" = "Right Temporal pole", 
+                                                 "rh.GM.transversetemporal" = "Right Transverse temporal cortex", 
+                                                 "rh.GM.insula" = "Right Insula", 
+                                                 "lh.GM.bankssts" = "Left Banks of the superior temporal sulcus", 
+                                                 "lh.GM.caudalanteriorcingulate" = "Left Caudal anterior cingulate cortex", 
+                                                 "lh.GM.caudalmiddlefrontal" = "Left Caudal middle frontal gyrus", 
+                                                 "lh.GM.cuneus" = "Left Cuneus cortex", 
+                                                 "lh.GM.entorhinal" = "Left Entorhinal cortex", 
+                                                 "lh.GM.fusiform" = "Left Fusiform gyrus", 
+                                                 "lh.GM.inferiorparietal" = "Left Inferior parietal cortex", 
+                                                 "lh.GM.inferiortemporal" = "Left Inferior temporal gyrus",
+                                                 "lh.GM.isthmuscingulate" = "Left Isthmus Anterior Cingulate cortex", 
+                                                 "lh.GM.lateraloccipital" = "Left Lateral occipital cortex", 
+                                                 "lh.GM.lateralorbitofrontal" = "Left Lateral Orbitofrontal cortex", 
+                                                 "lh.GM.lingual" = "Left Lingual gyrus", 
+                                                 "lh.GM.medialorbitofrontal" = "Left Medial Orbitofrontal cortex", 
+                                                 "lh.GM.middletemporal" = "Left Middle temporal gyrus", 
+                                                 "lh.GM.parahippocampal" = "Left Parahippocampal gyrus", 
+                                                 "lh.GM.paracentral" = "Left Paracentral lobule", 
+                                                 "lh.GM.parsopercularis" = "Left Pars opercularis", 
+                                                 "lh.GM.parsorbitalis" = "Left Pars orbitalis", 
+                                                 "lh.GM.parstriangularis" = "Left Pars triangularis", 
+                                                 "lh.GM.pericalcarine" = "Left Pericalcarine cortex", 
+                                                 "lh.GM.postcentral" = "Left Postcentral gyrus", 
+                                                 "lh.GM.posteriorcingulate" = "Left Posterior anterior cingulate cortex", 
+                                                 "lh.GM.precentral" = "Left Precentral gyrus", 
+                                                 "lh.GM.precuneus" = "Left Precuneus cortex", 
+                                                 "lh.GM.rostralanteriorcingulate" = "Left Rostral anterior cingulate cortex", 
+                                                 "lh.GM.rostralmiddlefrontal" = "Left Rostral middle frontal gyrus", 
+                                                 "lh.GM.superiorfrontal" = "Left Superior frontal gyrus", 
+                                                 "lh.GM.superiorparietal" = "Left Superior parietal cortex", 
+                                                 "lh.GM.superiortemporal" = "Left Superior temporal gyrus", 
+                                                 "lh.GM.supramarginal" = "Left Supramarginal gyrus", 
+                                                 "lh.GM.frontalpole" = "Left Frontal pole", 
+                                                 "lh.GM.temporalpole" = "Left Temporal pole", 
+                                                 "lh.GM.transversetemporal" = "Left Transverse temporal cortex", 
+                                                 "lh.GM.insula" = "Left Insula"))
+
+#expand cols
+dim_results_html <- results_html3 %>%
+  select(dependent, predictor, formatted_raw_est, formatted_std_est)%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  group_by(predictor, dependent, Estimate_Type) %>%
+  mutate(dup_id = row_number()) %>%
+  ungroup()%>%
+  pivot_wider(
+    names_from = c(dependent, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_",
+    id_cols = c(predictor, dup_id)
+  ) %>%
+  select(-dup_id)
+
+#create a variable that groups by predictor (ie: model) 
+imaging_predictors <- dim_results_html$predictor[seq(1, length(dim_results_html$predictor), by = 9)]
+dim_results_html$predictor_group <- rep(imaging_predictors, each = 9)
+
+#add hemisphere variable 
+dim_results_html <- dim_results_html %>%
+  mutate(hemisphere = case_when(startsWith(as.character(predictor_group), "Left") ~ "Left", 
+                                startsWith(as.character(predictor_group), "Right") ~ "Right"))%>%
+  mutate(predictor = case_when(startsWith(as.character(predictor), "Left") ~ "Regional Predictor", 
+                               startsWith(as.character(predictor), "Right") ~ "Regional Predictor", 
+                               TRUE ~ predictor))
+
+#Create a formatted regression table 
+dim_regression_table <- dim_results_html %>%
+  mutate(predictor = recode(predictor,"age" = "Age", "sex" = "Sex", "site" = "Site ID", "puberty" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))%>%
+  gt(groupname_col = "predictor_group", rowname_col = "predictor") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using regional cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    nihtbx_picvocab_uncorrected_formatted_raw_est = "Raw", nihtbx_picvocab_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_flanker_uncorrected_formatted_raw_est = "Raw", nihtbx_flanker_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_list_uncorrected_formatted_raw_est = "Raw", nihtbx_list_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_cardsort_uncorrected_formatted_raw_est = "Raw", nihtbx_cardsort_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_pattern_uncorrected_formatted_raw_est = "Raw", nihtbx_pattern_uncorrected_formatted_std_est = "Standardized",
+    nihtbx_picture_uncorrected_formatted_raw_est = "Raw", nihtbx_picture_uncorrected_formatted_std_est = "Standardized", 
+    nihtbx_reading_uncorrected_formatted_raw_est = "Raw", nihtbx_reading_uncorrected_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Language",
+    columns = c(nihtbx_picvocab_uncorrected_formatted_raw_est, nihtbx_picvocab_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Inhibitory Control",
+    columns = c(nihtbx_flanker_uncorrected_formatted_raw_est, nihtbx_flanker_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Cognitive Flexibility",
+    columns = c(nihtbx_list_uncorrected_formatted_raw_est, nihtbx_list_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Working Memory",
+    columns = c(nihtbx_cardsort_uncorrected_formatted_raw_est, nihtbx_cardsort_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Processing Speed",
+    columns = c(nihtbx_pattern_uncorrected_formatted_raw_est, nihtbx_pattern_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Episodic Memory",
+    columns = c(nihtbx_picture_uncorrected_formatted_raw_est, nihtbx_picture_uncorrected_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Reading",
+    columns = c(nihtbx_reading_uncorrected_formatted_raw_est, nihtbx_reading_uncorrected_formatted_std_est)
+  ) %>%
+  row_group_order(groups = unique(dim_results_html$predictor_group)) # Order models if necessary
+```
+
+Save the table as an HTML file
+```{r}
+dim_regression_table %>%
+  gtsave("cog_regional_dim_table.html")
+```
+
+
+-----------------------------------
+Make Heatmap Figures
+-----------------------------------
+
+Split matched results by hemisphere so figure is more interpretable: 
+```{r}
+results_rh<- results %>%
+  filter(str_starts(predictor, "rh."))%>%
+  mutate(hemisphere="Right Hemisphere")
+results_rh$predictor<-gsub('Transformed.q.wre','',results_rh$predictor)
+results_rh$predictor<-gsub('rh.GM.','',results_rh$predictor)
+
+results_lh<- results %>% 
+  filter(str_starts(predictor, "lh."))%>%
+  mutate(hemisphere="Left Hemisphere")
+results_lh$predictor<-gsub('Transformed.q.wre','',results_lh$predictor)
+results_lh$predictor<-gsub('lh.GM.','',results_lh$predictor)
+
+results<- rbind(results_rh, results_lh)
+```
+
+Reorder and rename as needed
+```{r}
+results$dependent<- (factor(results$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results$dependent<- revalue(results$dependent, c("nihtbx_picvocab_uncorrected" = "Language",
+                                  "nihtbx_flanker_uncorrected" = "Inhibitory Control", 
+                                  "nihtbx_list_uncorrected" = "Working Memory", 
+                                  "nihtbx_cardsort_uncorrected" = "Cognitive Flexibility", 
+                                  "nihtbx_pattern_uncorrected" = "Visual Processing", 
+                                  "nihtbx_picture_uncorrected" = "Episodic Memory", 
+                                  "nihtbx_reading_uncorrected" = "Reading"))
+
+results$predictor<- revalue(results$predictor, c("bankssts" = "Banks of the superior temporal sulcus", 
+                                                 "caudalanteriorcingulate" = "Caudal anterior cingulate cortex", 
+                                                 "caudalmiddlefrontal" = "Caudal middle frontal gyrus", 
+                                                 "cuneus" = "Cuneus cortex", 
+                                                 "entorhinal" = "Entorhinal cortex", 
+                                                 "fusiform" = "Fusiform gyrus", 
+                                                 "inferiorparietal" = "Inferior parietal cortex", 
+                                                 "inferiortemporal" = "Inferior temporal gyrus",
+                                                 "isthmuscingulate" = "Isthmus Anterior Cingulate cortex", 
+                                                 "lateraloccipital" = "Lateral occipital cortex", 
+                                                 "lateralorbitofrontal" = "Lateral Orbitofrontal cortex", 
+                                                 "lingual" = "Lingual gyrus", 
+                                                 "medialorbitofrontal" = "Medial Orbitofrontal cortex", 
+                                                 "middletemporal" = "Middle temporal gyrus", 
+                                                 "parahippocampal" = "Parahippocampal gyrus", 
+                                                 "paracentral" = "Paracentral lobule", 
+                                                 "parsopercularis" = "Pars opercularis", 
+                                                 "parsorbitalis" = "Pars orbitalis", 
+                                                 "parstriangularis" = "Pars triangularis", 
+                                                 "pericalcarine" = "Pericalcarine cortex", 
+                                                 "postcentral" = "Postcentral gyrus", 
+                                                 "posteriorcingulate" = "Posterior anterior cingulate cortex", 
+                                                 "precentral" = "Precentral gyrus", 
+                                                 "precuneus" = "Precuneus cortex", 
+                                                 "rostralanteriorcingulate" = "Rostral anterior cingulate cortex", 
+                                                 "rostralmiddlefrontal" = "Rostral middle frontal gyrus", 
+                                                 "superiorfrontal" = "Superior frontal gyrus", 
+                                                 "superiorparietal" = "Superior parietal cortex", 
+                                                 "superiortemporal" = "Superior temporal gyrus", 
+                                                 "supramarginal" = "Supramarginal gyrus", 
+                                                 "frontalpole" = "Frontal pole", 
+                                                 "temporalpole" = "Temporal pole", 
+                                                 "transversetemporal" = "Transverse temporal cortex", 
+                                                 "insula" = "Insula"))
+                                            
+```
+
+```{r}
+p_both_h<- ggplot(results, aes(y = dependent, x = predictor, fill = beta)) +
+  geom_tile(color = ifelse(results$ps_fdr < 0.05, "black", "grey"), 
+            lwd = ifelse(results$ps_fdr < 0.05, 0.5, 0), 
+            linetype = 1) + 
+  scale_fill_gradientn(colors = custom_colors(5), limits = c(-0.21, 0.21))+
+  coord_flip() +
+  theme_minimal() +
+  facet_grid(. ~ hemisphere,as.table = TRUE) +
+  labs(x = "", y = "", fill = "Beta Value") +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1, size=12), 
+        axis.text.y = element_text(size=12), 
+        strip.text = element_text(size = 13))
+p_both_h
+ggsave(file="FIGS/regional_cog_matched.svg", plot=p_both_h, width=10, height=8)
+```
+
+Split tail-sampled results by hemisphere so figure is more interpretable: 
+```{r}
+results_rh2<- results2 %>%
+  filter(str_starts(predictor, "rh."))%>%
+  mutate(hemisphere="Right Hemisphere")
+results_rh2$predictor<-gsub('Transformed.q.wre','',results_rh2$predictor)
+results_rh2$predictor<-gsub('rh.GM.','',results_rh2$predictor)
+
+results_lh2<- results2 %>% 
+  filter(str_starts(predictor, "lh."))%>%
+  mutate(hemisphere="Left Hemisphere")
+results_lh2$predictor<-gsub('Transformed.q.wre','',results_lh2$predictor)
+results_lh2$predictor<-gsub('lh.GM.','',results_lh2$predictor)
+
+results2<- rbind(results_rh2, results_lh2)
+```
+
+Reorder and rename as needed
+```{r}
+results2$dependent<- (factor(results2$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results2$dependent<- revalue(results2$dependent, c("nihtbx_picvocab_uncorrected" = "Language",
+                                  "nihtbx_flanker_uncorrected" = "Inhibitory Control", 
+                                  "nihtbx_list_uncorrected" = "Working Memory", 
+                                  "nihtbx_cardsort_uncorrected" = "Cognitive Flexibility", 
+                                  "nihtbx_pattern_uncorrected" = "Visual Processing", 
+                                  "nihtbx_picture_uncorrected" = "Episodic Memory", 
+                                  "nihtbx_reading_uncorrected" = "Reading"))
+
+results2$predictor<- revalue(results2$predictor, c("bankssts" = "Banks of the superior temporal sulcus", 
+                                                 "caudalanteriorcingulate" = "Caudal anterior cingulate cortex", 
+                                                 "caudalmiddlefrontal" = "Caudal middle frontal gyrus", 
+                                                 "cuneus" = "Cuneus cortex", 
+                                                 "entorhinal" = "Entorhinal cortex", 
+                                                 "fusiform" = "Fusiform gyrus", 
+                                                 "inferiorparietal" = "Inferior parietal cortex", 
+                                                 "inferiortemporal" = "Inferior temporal gyrus",
+                                                 "isthmuscingulate" = "Isthmus Anterior Cingulate cortex", 
+                                                 "lateraloccipital" = "Lateral occipital cortex", 
+                                                 "lateralorbitofrontal" = "Lateral Orbitofrontal cortex", 
+                                                 "lingual" = "Lingual gyrus", 
+                                                 "medialorbitofrontal" = "Medial Orbitofrontal cortex", 
+                                                 "middletemporal" = "Middle temporal gyrus", 
+                                                 "parahippocampal" = "Parahippocampal gyrus", 
+                                                 "paracentral" = "Paracentral lobule", 
+                                                 "parsopercularis" = "Pars opercularis", 
+                                                 "parsorbitalis" = "Pars orbitalis", 
+                                                 "parstriangularis" = "Pars triangularis", 
+                                                 "pericalcarine" = "Pericalcarine cortex", 
+                                                 "postcentral" = "Postcentral gyrus", 
+                                                 "posteriorcingulate" = "Posterior anterior cingulate cortex", 
+                                                 "precentral" = "Precentral gyrus", 
+                                                 "precuneus" = "Precuneus cortex", 
+                                                 "rostralanteriorcingulate" = "Rostral anterior cingulate cortex", 
+                                                 "rostralmiddlefrontal" = "Rostral middle frontal gyrus", 
+                                                 "superiorfrontal" = "Superior frontal gyrus", 
+                                                 "superiorparietal" = "Superior parietal cortex", 
+                                                 "superiortemporal" = "Superior temporal gyrus", 
+                                                 "supramarginal" = "Supramarginal gyrus", 
+                                                 "frontalpole" = "Frontal pole", 
+                                                 "temporalpole" = "Temporal pole", 
+                                                 "transversetemporal" = "Transverse temporal cortex", 
+                                                 "insula" = "Insula"))
+                                            
+```
+
+```{r}
+p_both_h2<- ggplot(results2, aes(y = dependent, x = predictor, fill = beta)) +
+  geom_tile(color = ifelse(results2$ps_fdr < 0.05, "black", "grey"), 
+            lwd = ifelse(results2$ps_fdr < 0.05, 0.5, 0), 
+            linetype = 1) + 
+  scale_fill_gradientn(colors = custom_colors(5), limits = c(-0.21, 0.21))+
+  coord_flip() +
+  theme_minimal() +
+  facet_grid(. ~ hemisphere,as.table = TRUE) +
+  labs(x = "", y = "", fill = "Beta Value") +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1, size=12), 
+        axis.text.y = element_text(size=12), 
+        strip.text = element_text(size = 13))
+p_both_h2
+ggsave(file="FIGS/regional_cog_tails.svg", plot=p_both_h2, width=10, height=8)
+```
+
+Split by dimensional hemisphere so figure is more interpretable: 
+```{r}
+results_rh3<- results3 %>%
+  filter(str_starts(predictor, "rh."))%>%
+  mutate(hemisphere="Right Hemisphere")
+results_rh3$predictor<-gsub('Transformed.q.wre','',results_rh3$predictor)
+results_rh3$predictor<-gsub('rh.GM.','',results_rh3$predictor)
+
+results_lh3<- results3 %>% 
+  filter(str_starts(predictor, "lh."))%>%
+  mutate(hemisphere="Left Hemisphere")
+results_lh3$predictor<-gsub('Transformed.q.wre','',results_lh3$predictor)
+results_lh3$predictor<-gsub('lh.GM.','',results_lh3$predictor)
+
+results3<- rbind(results_rh3, results_lh3)
+```
+
+Reorder and rename as needed
+```{r}
+results3$dependent<- (factor(results3$dependent, levels = c("nihtbx_cardsort_uncorrected", 
+                                                          "nihtbx_flanker_uncorrected", 
+                                                          "nihtbx_list_uncorrected", 
+                                                          "nihtbx_pattern_uncorrected", 
+                                                          "nihtbx_picture_uncorrected", 
+                                                          "nihtbx_picvocab_uncorrected", 
+                                                          "nihtbx_reading_uncorrected")))
+
+results3$dependent<- revalue(results3$dependent, c("nihtbx_picvocab_uncorrected" = "Language",
+                                  "nihtbx_flanker_uncorrected" = "Inhibitory Control", 
+                                  "nihtbx_list_uncorrected" = "Working Memory", 
+                                  "nihtbx_cardsort_uncorrected" = "Cognitive Flexibility", 
+                                  "nihtbx_pattern_uncorrected" = "Visual Processing", 
+                                  "nihtbx_picture_uncorrected" = "Episodic Memory", 
+                                  "nihtbx_reading_uncorrected" = "Reading"))
+
+results3$predictor<- revalue(results3$predictor, c("bankssts" = "Banks of the superior temporal sulcus", 
+                                                 "caudalanteriorcingulate" = "Caudal anterior cingulate cortex", 
+                                                 "caudalmiddlefrontal" = "Caudal middle frontal gyrus", 
+                                                 "cuneus" = "Cuneus cortex", 
+                                                 "entorhinal" = "Entorhinal cortex", 
+                                                 "fusiform" = "Fusiform gyrus", 
+                                                 "inferiorparietal" = "Inferior parietal cortex", 
+                                                 "inferiortemporal" = "Inferior temporal gyrus",
+                                                 "isthmuscingulate" = "Isthmus Anterior Cingulate cortex", 
+                                                 "lateraloccipital" = "Lateral occipital cortex", 
+                                                 "lateralorbitofrontal" = "Lateral Orbitofrontal cortex", 
+                                                 "lingual" = "Lingual gyrus", 
+                                                 "medialorbitofrontal" = "Medial Orbitofrontal cortex", 
+                                                 "middletemporal" = "Middle temporal gyrus", 
+                                                 "parahippocampal" = "Parahippocampal gyrus", 
+                                                 "paracentral" = "Paracentral lobule", 
+                                                 "parsopercularis" = "Pars opercularis", 
+                                                 "parsorbitalis" = "Pars orbitalis", 
+                                                 "parstriangularis" = "Pars triangularis", 
+                                                 "pericalcarine" = "Pericalcarine cortex", 
+                                                 "postcentral" = "Postcentral gyrus", 
+                                                 "posteriorcingulate" = "Posterior anterior cingulate cortex", 
+                                                 "precentral" = "Precentral gyrus", 
+                                                 "precuneus" = "Precuneus cortex", 
+                                                 "rostralanteriorcingulate" = "Rostral anterior cingulate cortex", 
+                                                 "rostralmiddlefrontal" = "Rostral middle frontal gyrus", 
+                                                 "superiorfrontal" = "Superior frontal gyrus", 
+                                                 "superiorparietal" = "Superior parietal cortex", 
+                                                 "superiortemporal" = "Superior temporal gyrus", 
+                                                 "supramarginal" = "Supramarginal gyrus", 
+                                                 "frontalpole" = "Frontal pole", 
+                                                 "temporalpole" = "Temporal pole", 
+                                                 "transversetemporal" = "Transverse temporal cortex", 
+                                                 "insula" = "Insula"))
+                                            
+```
+
+```{r}
+p_both_h3<- ggplot(results3, aes(y = dependent, x = predictor, fill = beta)) +
+  geom_tile(color = ifelse(results3$ps_fdr < 0.05, "black", "grey"), 
+            lwd = ifelse(results3$ps_fdr < 0.05, 0.5, 0), 
+            linetype = 1) + 
+  scale_fill_gradientn(colors = custom_colors(5), limits = c(-0.21, 0.21))+
+  coord_flip() +
+  theme_minimal() +
+  facet_grid(. ~ hemisphere,as.table = TRUE) +
+  labs(x = "", y = "", fill = "Beta Value") +
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1, size=12), 
+        axis.text.y = element_text(size=12), 
+        strip.text = element_text(size = 13))
+p_both_h3
+ggsave(file="FIGS/regional_cog_dim.svg", plot=p_both_h3, width=10, height=8)
+
+```
+Add in one figure 
+```{r}
+cog_fig<- ggarrange(p_both_h3, p_both_h2,p_both_h,  nrow=3, ncol=1, labels=c("Dimensional", "Tail-Sampled", "Propensity Matched"),
+                        common.legend = T, legend="right")
+cog_fig
+```
+
+-----------------------------------
+Make Brain Figures
+-----------------------------------
+
+First, load the brain package and the atlas names 
+```{r}
+library(ggseg)
+setwd('~/Downloads')
+atlas_regions<- read.csv('dk_ggseg.csv')
+atlas_regions<- c(atlas_regions$x, atlas_regions$x)
+```
+
+We want to project the number of significant relationships across tasks are present across each region. 
+
+Create a variable per each results data set that sums how many significant relationships there are per predictor(start with matched results)
+```{r}
+results_wide_left<- results%>%
+  filter(hemisphere=="Left Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Left Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide_right<- results%>%
+  filter(hemisphere=="Right Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Right Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide<- rbind(results_wide_left, results_wide_right)
+results_wide$region<- atlas_regions
+```
+
+And project this to a brain
+```{r}
+match_brain<- results_wide%>%
+  ggplot()+
+  geom_brain(atlas = dk, 
+             position = position_brain(hemi ~ side),
+             aes(fill = num_sig)) +
+  scale_fill_gradient2(
+    low = "white", 
+    mid = "yellow", 
+    high = "red", 
+    midpoint = 4, 
+    limits = c(0, 7),  # Ensure the scale includes zero
+  ) + theme_classic() + labs(fill="Number of Significant Predictors")
+match_brain
+
+ggsave(file="FIGS/brain_cog_matched.svg", plot=match_brain, width=10, height=8)
+``` 
+
+Repeat with tail-sampled results 
+```{r}
+results_wide_left2<- results2%>%
+  filter(hemisphere=="Left Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Left Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide_right2<- results2%>%
+  filter(hemisphere=="Right Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Right Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide2<- rbind(results_wide_left2, results_wide_right2)
+results_wide2$region<- atlas_regions
+```
+
+And project this to a brain
+```{r}
+tail_brain<-results_wide2%>%
+  ggplot()+
+  geom_brain(atlas = dk, 
+             position = position_brain(hemi ~ side),
+             aes(fill = num_sig)) +
+  scale_fill_gradient2(
+    low = "white", 
+    mid = "yellow", 
+    high = "red", 
+    midpoint = 4, 
+    limits = c(0, 7),  # Ensure the scale includes zero
+  ) + theme_classic() + labs(fill="Number of Significant Predictors")
+match_brain
+
+ggsave(file="FIGS/brain_cog_tails.svg", plot=tail_brain, width=10, height=8)
+```
+And again for dimensional results 
+```{r}
+results_wide_left3<- results3%>%
+  filter(hemisphere=="Left Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Left Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide_right3<- results3%>%
+  filter(hemisphere=="Right Hemisphere")%>%
+  select(predictor, dependent, ps_fdr)%>%
+  pivot_wider(names_from = dependent, values_from = ps_fdr)%>%
+  mutate(num_sig = rowSums(across(where(is.numeric), ~ . < 0.05)))%>%
+  mutate(hemisphere="Right Hemisphere")%>%
+  select(predictor, num_sig, hemisphere)
+
+results_wide3<- rbind(results_wide_left3, results_wide_right3)
+results_wide3$region<- atlas_regions
+```
+
+And project this to a brain
+```{r}
+dim_brain<-results_wide3%>%
+  ggplot()+
+  geom_brain(atlas = dk, 
+             position = position_brain(hemi ~ side),
+             aes(fill = num_sig)) +
+  scale_fill_gradient2(
+    low = "white", 
+    mid = "yellow", 
+    high = "red", 
+    midpoint = 4, 
+    limits = c(0, 7),  # Ensure the scale includes zero
+  ) + theme_classic() + labs(fill="Number of Significant Predictors")
+match_brain
+
+ggsave(file="FIGS/brain_cog_dim.svg", plot=dim_brain, width=10, height=8)
+```
+
+Arrange 
+```{r}
+brain_dim_fig<- ggarrange(p_both_h3,dim_brain,  nrow=2, ncol=1, labels=c("A", "Dimensional"))
+brain_dim_fig
+
+brain_tail_fig<- ggarrange( p_both_h2,tail_brain, nrow=2, ncol=1, labels=c("B", "Tail-Sampled"))
+brain_tail_fig
+
+brain_match_fig<- ggarrange( p_both_h, match_brain, nrow=2, ncol=1, labels=c("C", "Propensity Matched"))
+brain_match_fig
+```
+

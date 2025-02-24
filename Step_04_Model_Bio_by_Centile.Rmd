@@ -1,0 +1,840 @@
+---
+title: "Topography Matching Notebook Step 2"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R Notebook runs multivariate multiple regression to model the effects of brain tissue type group on biological outcomes using dimensional, tail sampled, and propensity matched modeling strategies. 
+
+-----------------------------------
+Set Up
+-----------------------------------
+
+First, install necessary packages.
+```{r}
+library(MatchIt)
+library(boxr)
+library(tidyr)
+library(dplyr)
+library(cobalt)
+library(ggplot2)
+library(finalfit)
+library(Hmisc)
+library(lm.beta)
+library(ggpubr)
+library(bayesbio)
+library(lavaan)
+library(knitr) 
+library(gt)
+library(mde)
+```
+
+Specify that select function should be pulled from dplyr
+
+```{r}
+select <- dplyr::select
+recode <- dplyr::recode
+```
+
+Next, log into PennBox, and set working directory the ABCD directory.
+
+```{r}
+box_auth()
+
+box_setwd('167848222541')
+```
+
+Load in matched network data:
+```{r}
+match_vent_data<-box_read('1438682877497', fread=TRUE)
+match_sGMV_data<-box_read('1438681749218', fread=TRUE)
+match_WMV_data<-box_read('1438687945370', fread=TRUE)
+match_GMV_data<-box_read('1438677748369', fread=TRUE)
+```
+
+Read in outcome data 
+```{r}
+bio<-box_read('1301072938826', fread=TRUE)
+bio<-bio[,c(2:5, 11)]
+bio$participant<-gsub('sub-NDARINV','NDAR_INV',bio$participant)
+ga<-box_read('1277090709031', fread=TRUE)
+bmi<-box_read('1441672468205', fread=TRUE)%>%
+  select(subjectkey, bmi)
+```
+calculate gestational age and recalc birthday weight in lbs and oz
+
+make a group variable (adolescents born at less than 33 weeks, 34–35 weeks, 36 weeks, 37–39 weeks, and 40 weeks of gestation)
+```{r}
+ga_clean<-as_tibble(ga)%>%
+  select(src_subject_id, eventname, birth_weight_lbs, birth_weight_oz, devhx_12a_p, devhx_12_p)%>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  mutate(birth_weight_oz=birth_weight_oz/16)%>%
+  mutate(bw= birth_weight_lbs +birth_weight_oz)%>%
+  recode_na_as(subset_cols= 'devhx_12_p', value=0)%>%
+  recode_as_na(subset_cols= 'devhx_12a_p', value=999)%>%
+  mutate(ga= 40-devhx_12_p)%>%
+  mutate(ga_group = case_when(
+      ga == 40 ~ "1",
+      ga >=37 & ga <=39  ~ "2",
+      ga == 36 ~ "3", 
+      ga >=34 & ga <=35 ~ "4", 
+      ga <=33 ~ "5"
+    ))
+```
+
+and merge into data:
+
+```{r}
+GMV_test_data<- merge(match_GMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+GMV_test_data<- merge(GMV_test_data, bmi)
+
+WMV_test_data<- merge(match_WMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+WMV_test_data<- merge(WMV_test_data, bmi)
+
+sGMV_test_data<- merge(match_sGMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+sGMV_test_data<- merge(sGMV_test_data, bmi)
+
+vent_test_data<- merge(match_vent_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+vent_test_data<- merge(vent_test_data, bmi)
+```
+
+```{r}
+psych::describe(GMV_test_data)
+psych::describe(WMV_test_data)
+psych::describe(sGMV_test_data)
+psych::describe(vent_test_data)
+```
+Finally, load in unmatched network data: 
+```{r}
+unmatched_GMV_data<-box_read('1442236849436', fread=TRUE)
+unmatched_WMV_data<-box_read('1442223376606', fread=TRUE)
+unmatched_sGMV_data<-box_read('1442239979732', fread=TRUE)
+unmatched_vent_data<-box_read('1442240154828', fread=TRUE)
+```
+
+and merge into data:
+```{r}
+GMV_test_data2<- merge(unmatched_GMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+GMV_test_data2<- merge(GMV_test_data2, bmi)
+
+WMV_test_data2<- merge(unmatched_WMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+WMV_test_data2<- merge(WMV_test_data2, bmi)
+
+sGMV_test_data2<- merge(unmatched_sGMV_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+sGMV_test_data2<- merge(sGMV_test_data2, bmi)
+
+vent_test_data2<- merge(unmatched_vent_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+vent_test_data2<- merge(vent_test_data2, bmi)
+```
+
+
+```{r}
+psych::describe(GMV_test_data)
+psych::describe(WMV_test_data)
+psych::describe(sGMV_test_data)
+psych::describe(vent_test_data)
+```
+
+Load in dimensional network data: 
+```{r}
+all_dimensional_data<-box_read('1442204075893', fread=TRUE)
+
+all_dimensional_data<- merge(all_dimensional_data, ga_clean, by.x='subjectkey', by.y='src_subject_id')%>%
+  mutate_at(vars(-c("subjectkey")),as.numeric)
+all_dimensional_data<- merge(all_dimensional_data, bmi)
+```
+
+```{r}
+#psych::describe(all_dimensional_data)
+```
+-----------------------------------
+Specify Models
+-----------------------------------
+
+Specify group-based models for Lavaan: 
+(these can be used with different data sets for both tail sampled and pm'd models)
+
+```{r}
+bio_group_models<- 
+'
+bw ~ group + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+ga_group ~ group + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bmi ~ group + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bw ~~ ga_group
+ga_group ~~ bmi
+bmi ~~ bw
+'
+```
+
+Specify dimensional models for Lavaan: 
+```{r}
+bio_gmv_model<- 
+'
+bw ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+ga_group ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bmi ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bw ~~ ga_group
+ga_group ~~ bmi
+bmi ~~ bw
+'
+bio_wmv_model<- 
+'
+bw ~ WMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+ga_group ~ WMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bmi ~ WMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bw ~~ ga_group
+ga_group ~~ bmi
+bmi ~~ bw
+'
+bio_sgmv_model<- 
+'
+bw ~ sGMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+ga_group ~ sGMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bmi ~ sGMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bw ~~ ga_group
+ga_group ~~ bmi
+bmi ~~ bw
+'
+bio_vent_model<- 
+'
+bw ~ Ventricles + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+ga_group ~ Ventricles + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bmi ~ Ventricles + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income
+bw ~~ ga_group
+ga_group ~~ bmi
+bmi ~~ bw
+'
+```
+
+-----------------------------------
+Evaluate Fit
+-----------------------------------
+Evaluate Fit in Matched Data 
+```{r}
+matched_GMV_fit <- sem(bio_group_models, data=GMV_test_data, missing="ML", estimator="MLR")
+#summary(matched_GMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+matched_WMV_fit <- sem(bio_group_models, data=WMV_test_data, missing="ML", estimator="MLR")
+#summary(matched_WMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+matched_sGMV_fit <- sem(bio_group_models, data=sGMV_test_data, missing="ML", estimator="MLR")
+#summary(matched_sGMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+matched_vent_fit <- sem(bio_group_models, data=vent_test_data, missing="ML", estimator="MLR")
+#summary(matched_vent_fit, standardized = T, fit = F, rsquare = T, ci = T)
+```
+
+
+Evaluate Fit in Tail-Sampled Data 
+```{r}
+tails_GMV_fit <- sem(bio_group_models, data=GMV_test_data2, missing="ML", estimator="MLR")
+#summary(tails_GMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+tails_WMV_fit <- sem(bio_group_models, data=WMV_test_data2, missing="ML", estimator="MLR")
+#summary(tails_WMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+tails_sGMV_fit <- sem(bio_group_models, data=sGMV_test_data2, missing="ML", estimator="MLR")
+#summary(tails_sGMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+tails_vent_fit <- sem(bio_group_models, data=vent_test_data2, missing="ML", estimator="MLR")
+#summary(tails_vent_fit, standardized = T, fit = F, rsquare = T, ci = T)
+```
+
+
+
+
+Evaluate Fit in Tail-Sampled Data 
+```{r}
+dim_GMV_fit <- sem(bio_gmv_model, data=all_dimensional_data, missing="ML", estimator="MLR")
+#summary(tails_GMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+dim_WMV_fit <- sem(bio_wmv_model, data=all_dimensional_data, missing="ML", estimator="MLR")
+#summary(tails_WMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+dim_sGMV_fit <- sem(bio_sgmv_model, data=all_dimensional_data, missing="ML", estimator="MLR")
+#summary(tails_sGMV_fit, standardized = T, fit = F, rsquare = T, ci = T)
+
+dim_vent_fit <- sem(bio_vent_model, data=all_dimensional_data, missing="ML", estimator="MLR")
+#summary(tails_vent_fit, standardized = T, fit = F, rsquare = T, ci = T)
+```
+
+
+Now FDR correct + add a variable for model type 
+```{r}
+matched_GMV_fdr<- parameterEstimates(matched_GMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'matched')
+
+matched_WMV_fdr<- parameterEstimates(matched_WMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'matched')
+
+matched_sGMV_fdr<- parameterEstimates(matched_sGMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'matched')
+
+matched_vent_fdr<- parameterEstimates(matched_vent_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'matched')
+
+dim_GMV_fdr<- parameterEstimates(dim_GMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'dim')
+
+dim_WMV_fdr<- parameterEstimates(dim_WMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'dim')
+
+dim_sGMV_fdr<- parameterEstimates(dim_sGMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'dim')
+
+dim_vent_fdr<- parameterEstimates(dim_vent_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'dim')
+
+tails_GMV_fdr<- parameterEstimates(tails_GMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'tails')
+
+tails_WMV_fdr<- parameterEstimates(tails_WMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'tails')
+
+tails_sGMV_fdr<- parameterEstimates(tails_sGMV_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'tails')
+
+tails_vent_fdr<- parameterEstimates(tails_vent_fit, standardized = TRUE)%>%
+  filter(op == "~")%>%
+  select(lhs, rhs, est, se, pvalue, std.all)%>%
+  mutate(ps_fdr= (p.adjust.nlp(pvalue, method='fdr', n=108)))%>%
+  mutate(type = 'tails')
+```
+
+-----------------------------------
+Format Results
+-----------------------------------
+
+GMV:
+```{r}
+#Format dimensionl results 
+dim_GMV_html<- dim_GMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+dim_GMV_html$formatted_raw_est <- paste0(round(dim_GMV_html$est,2), ", (", round(dim_GMV_html$se,2), ")")
+dim_GMV_html$formatted_std_est <- paste0(round(dim_GMV_html$std.all,2), dim_GMV_html$significance)
+
+dim_GMV_html <- dim_GMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Dimensional Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format tail-sampled results
+tails_GMV_html<- tails_GMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+tails_GMV_html$formatted_raw_est <- paste0(round(tails_GMV_html$est,2), ", (", round(tails_GMV_html$se,2), ")")
+tails_GMV_html$formatted_std_est <- paste0(round(tails_GMV_html$std.all,2), tails_GMV_html$significance)
+
+tails_GMV_html<- tails_GMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Tail-Sampled Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format matched results
+matched_GMV_html<- matched_GMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+matched_GMV_html$formatted_raw_est <- paste0(round(matched_GMV_html$est,2), ", (", round(matched_GMV_html$se,2), ")")
+matched_GMV_html$formatted_std_est <- paste0(round(matched_GMV_html$std.all,2), matched_GMV_html$significance)
+
+matched_GMV_html <- matched_GMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model= 'Propensity Matched Models')%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Combine results, rename rhs
+combined_GMV_html<- rbind(dim_GMV_html, tails_GMV_html, matched_GMV_html)%>%
+  mutate(rhs = recode(rhs, "GMV" = "cGM", "age" = "Age", "sex" = "Sex", "site_id" = "Site ID", "puberty_stage" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race_3" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))
+
+#Create a formatted regression table 
+GMV_regression_table <- combined_GMV_html %>%
+  gt(groupname_col = "model", rowname_col = "rhs") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    bw_formatted_raw_est = "Raw", bw_formatted_std_est = "Standardized",
+    ga_group_formatted_raw_est = "Raw", ga_group_formatted_std_est = "Standardized",
+    bmi_formatted_raw_est = "Raw", bmi_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Birthweight",
+    columns = c(bw_formatted_raw_est, bw_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Gestational Age",
+    columns = c(ga_group_formatted_raw_est, ga_group_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Body Mass Index",
+    columns = c(bmi_formatted_raw_est, bmi_formatted_std_est)
+  ) %>%
+  row_group_order(groups = c("Dimensional Models", "Tail-Sampled Models", "Propensity Matched Models")) # Order models if necessary
+
+# Save the table as an HTML file
+GMV_regression_table %>%
+  gtsave("FINAL_REGRESSION_TABLES/HTML/bio_GMV_table.html")
+```
+
+WMV:
+```{r}
+#Format dimensionl results 
+dim_WMV_html<- dim_WMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+dim_WMV_html$formatted_raw_est <- paste0(round(dim_WMV_html$est,2), ", (", round(dim_WMV_html$se,2), ")")
+dim_WMV_html$formatted_std_est <- paste0(round(dim_WMV_html$std.all,2), dim_WMV_html$significance)
+
+dim_WMV_html <- dim_WMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Dimensional Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format tail-sampled results
+tails_WMV_html<- tails_WMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+tails_WMV_html$formatted_raw_est <- paste0(round(tails_WMV_html$est,2), ", (", round(tails_WMV_html$se,2), ")")
+tails_WMV_html$formatted_std_est <- paste0(round(tails_WMV_html$std.all,2), tails_WMV_html$significance)
+
+tails_WMV_html<- tails_WMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Tail-Sampled Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format matched results
+matched_WMV_html<- matched_WMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+matched_WMV_html$formatted_raw_est <- paste0(round(matched_WMV_html$est,2), ", (", round(matched_WMV_html$se,2), ")")
+matched_WMV_html$formatted_std_est <- paste0(round(matched_WMV_html$std.all,2), matched_WMV_html$significance)
+
+matched_WMV_html <- matched_WMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model= 'Propensity Matched Models')%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Combine results, rename rhs
+combined_WMV_html<- rbind(dim_WMV_html, tails_WMV_html, matched_WMV_html)%>%
+  mutate(rhs = recode(rhs, "WMV" = "WM", "age" = "Age", "sex" = "Sex", "site_id" = "Site ID", "puberty_stage" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race_3" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))
+
+#Create a formatted regression table 
+WMV_regression_table <- combined_WMV_html %>%
+  gt(groupname_col = "model", rowname_col = "rhs") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    bw_formatted_raw_est = "Raw", bw_formatted_std_est = "Standardized",
+    ga_group_formatted_raw_est = "Raw", ga_group_formatted_std_est = "Standardized",
+    bmi_formatted_raw_est = "Raw", bmi_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Birthweight",
+    columns = c(bw_formatted_raw_est, bw_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Gestational Age",
+    columns = c(ga_group_formatted_raw_est, ga_group_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Body Mass Index",
+    columns = c(bmi_formatted_raw_est, bmi_formatted_std_est)
+  ) %>%
+  row_group_order(groups = c("Dimensional Models", "Tail-Sampled Models", "Propensity Matched Models")) # Order models if necessary
+
+# Save the table as an HTML file
+WMV_regression_table %>%
+  gtsave("FINAL_REGRESSION_TABLES/HTML/bio_WMV_table.html")
+```
+
+sGMV:
+```{r}
+#Format dimensionl results 
+dim_sGMV_html<- dim_sGMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+dim_sGMV_html$formatted_raw_est <- paste0(round(dim_sGMV_html$est,2), ", (", round(dim_sGMV_html$se,2), ")")
+dim_sGMV_html$formatted_std_est <- paste0(round(dim_sGMV_html$std.all,2), dim_sGMV_html$significance)
+
+dim_sGMV_html <- dim_sGMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Dimensional Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format tail-sampled results
+tails_sGMV_html<- tails_sGMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+tails_sGMV_html$formatted_raw_est <- paste0(round(tails_sGMV_html$est,2), ", (", round(tails_sGMV_html$se,2), ")")
+tails_sGMV_html$formatted_std_est <- paste0(round(tails_sGMV_html$std.all,2), tails_sGMV_html$significance)
+
+tails_sGMV_html<- tails_sGMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Tail-Sampled Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format matched results
+matched_sGMV_html<- matched_sGMV_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+matched_sGMV_html$formatted_raw_est <- paste0(round(matched_sGMV_html$est,2), ", (", round(matched_sGMV_html$se,2), ")")
+matched_sGMV_html$formatted_std_est <- paste0(round(matched_sGMV_html$std.all,2), matched_sGMV_html$significance)
+
+matched_sGMV_html <- matched_sGMV_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model= 'Propensity Matched Models')%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Combine results, rename rhs
+combined_sGMV_html<- rbind(dim_sGMV_html, tails_sGMV_html, matched_sGMV_html)%>%
+  mutate(rhs = recode(rhs, "sGMV" = "sGM", "age" = "Age", "sex" = "Sex", "site_id" = "Site ID", "puberty_stage" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race_3" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))
+
+#Create a formatted regression table 
+sGMV_regression_table <- combined_sGMV_html %>%
+  gt(groupname_col = "model", rowname_col = "rhs") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    bw_formatted_raw_est = "Raw", bw_formatted_std_est = "Standardized",
+    ga_group_formatted_raw_est = "Raw", ga_group_formatted_std_est = "Standardized",
+    bmi_formatted_raw_est = "Raw", bmi_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Birthweight",
+    columns = c(bw_formatted_raw_est, bw_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Gestational Age",
+    columns = c(ga_group_formatted_raw_est, ga_group_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Body Mass Index",
+    columns = c(bmi_formatted_raw_est, bmi_formatted_std_est)
+  ) %>%
+  row_group_order(groups = c("Dimensional Models", "Tail-Sampled Models", "Propensity Matched Models")) # Order models if necessary
+
+# Save the table as an HTML file
+sGMV_regression_table %>%
+  gtsave("FINAL_REGRESSION_TABLES/HTML/bio_sGMV_table.html")
+```
+
+vent:
+```{r}
+#Format dimensionl results 
+dim_vent_html<- dim_vent_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+dim_vent_html$formatted_raw_est <- paste0(round(dim_vent_html$est,2), ", (", round(dim_vent_html$se,2), ")")
+dim_vent_html$formatted_std_est <- paste0(round(dim_vent_html$std.all,2), dim_vent_html$significance)
+
+dim_vent_html <- dim_vent_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Dimensional Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format tail-sampled results
+tails_vent_html<- tails_vent_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+tails_vent_html$formatted_raw_est <- paste0(round(tails_vent_html$est,2), ", (", round(tails_vent_html$se,2), ")")
+tails_vent_html$formatted_std_est <- paste0(round(tails_vent_html$std.all,2), tails_vent_html$significance)
+
+tails_vent_html<- tails_vent_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model = "Tail-Sampled Models")%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Format matched results
+matched_vent_html<- matched_vent_fdr %>%
+  mutate(significance = case_when(
+    ps_fdr < 0.001 ~ '***',
+    ps_fdr < 0.01  ~ '**',
+    ps_fdr < 0.05  ~ '*',
+    ps_fdr < 0.10 ~ '†', 
+    TRUE            ~ ''  # ns for not significant
+  ))
+
+matched_vent_html$formatted_raw_est <- paste0(round(matched_vent_html$est,2), ", (", round(matched_vent_html$se,2), ")")
+matched_vent_html$formatted_std_est <- paste0(round(matched_vent_html$std.all,2), matched_vent_html$significance)
+
+matched_vent_html <- matched_vent_html %>%
+  select(lhs, rhs, formatted_raw_est, formatted_std_est)%>%
+  mutate(model= 'Propensity Matched Models')%>%
+  pivot_longer(cols=c(formatted_raw_est, formatted_std_est), 
+               names_to = "Estimate_Type", 
+               values_to = "Estimate")%>%
+  pivot_wider(
+    names_from = c(lhs, Estimate_Type),
+    values_from = Estimate,
+    names_sep = "_")
+
+#Combine results, rename rhs
+combined_vent_html<- rbind(dim_vent_html, tails_vent_html, matched_vent_html)%>%
+  mutate(rhs = recode(rhs, "vent" = "CSF", "age" = "Age", "sex" = "Sex", "site_id" = "Site ID", "puberty_stage" = "Pubertal Stage", 
+                      "ethnicity" = "Ethnicity", "race_3" = "Race", "parent_education" = "Parental Education", "combined_income" = "Combined Income"))
+
+#Create a formatted regression table 
+vent_regression_table <- combined_vent_html %>%
+  gt(groupname_col = "model", rowname_col = "rhs") %>%
+  tab_header(
+    title = "Table X. Regression results for models predicting cognitive outcomes using cGM across 3 modeling frameworks, controlling for covaraites",
+    subtitle = "Raw and Standardized Estimates"
+  ) %>%
+  cols_label(
+    bw_formatted_raw_est = "Raw", bw_formatted_std_est = "Standardized",
+    ga_group_formatted_raw_est = "Raw", ga_group_formatted_std_est = "Standardized",
+    bmi_formatted_raw_est = "Raw", bmi_formatted_std_est = "Standardized"
+  ) %>%
+  tab_spanner(
+    label = "Birthweight",
+    columns = c(bw_formatted_raw_est, bw_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Gestational Age",
+    columns = c(ga_group_formatted_raw_est, ga_group_formatted_std_est)
+  ) %>%
+  tab_spanner(
+    label = "Body Mass Index",
+    columns = c(bmi_formatted_raw_est, bmi_formatted_std_est)
+  ) %>%
+  row_group_order(groups = c("Dimensional Models", "Tail-Sampled Models", "Propensity Matched Models")) # Order models if necessary
+
+# Save the table as an HTML file
+vent_regression_table %>%
+  gtsave("FINAL_REGRESSION_TABLES/HTML/bio_vent_table.html")
+```
+
+And finally, add ALL beta's and p's together in one file to make the heat map: 
+```{r}
+matched_GMV_fdr<- as.data.frame(matched_GMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "GMV")
+
+matched_WMV_fdr<- as.data.frame(matched_WMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "WMV")
+
+matched_sGMV_fdr<- as.data.frame(matched_sGMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "sGMV")
+
+matched_vent_fdr<- as.data.frame(matched_vent_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "Ventricles")
+
+dim_GMV_fdr<- as.data.frame(dim_GMV_fdr)%>%
+  filter(rhs == "GMV")
+
+dim_WMV_fdr<- as.data.frame(dim_WMV_fdr)%>%
+  filter(rhs == "WMV")
+
+dim_sGMV_fdr<- as.data.frame(dim_sGMV_fdr)%>%
+  filter(rhs == "sGMV")
+
+dim_vent_fdr<- as.data.frame(dim_vent_fdr)%>%
+  filter(rhs == "Ventricles")
+
+tails_GMV_fdr<- as.data.frame(tails_GMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "GMV")
+
+tails_WMV_fdr<- as.data.frame(tails_WMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "WMV")
+
+tails_sGMV_fdr<- as.data.frame(tails_sGMV_fdr)%>%
+  filter(rhs == "group")%>%
+  mutate(rhs = "sGMV")
+
+tails_vent_fdr<- as.data.frame(tails_vent_fdr)%>%
+  filter(rhs == "group")%>% 
+  mutate(rhs = "Ventricles")
+
+all_bio<-rbind(matched_GMV_fdr, matched_WMV_fdr, matched_sGMV_fdr, matched_vent_fdr, dim_GMV_fdr, dim_WMV_fdr, dim_sGMV_fdr, dim_vent_fdr, tails_GMV_fdr, 
+                tails_WMV_fdr, tails_sGMV_fdr, tails_vent_fdr)
+
+box_write(all_bio, file_name = 'all_bio_stats_UNSCALED_10.21.24.csv', dir_id = '203279384208')
+```

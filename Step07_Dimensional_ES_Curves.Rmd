@@ -1,0 +1,260 @@
+---
+title: "Step 07: Check Stability of ES in Total Sample"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R Notebook checks stability of ES in dimensional analyses by running models in randomly selected samples between n=100 and n=600 100 times each. 
+
+------------------------------
+Set Up
+------------------------------
+
+First, install necessary packages.
+```{r}
+library(MatchIt)
+library(boxr)
+library(tidyr)
+library(dplyr)
+library(cobalt)
+library(ggplot2)
+library(finalfit)
+library(Hmisc)
+library(lm.beta)
+library(ggpubr)
+library(bayesbio)
+library(mde)
+library(lavaan) 
+library(knitr)
+```
+
+Specify that select function should be pulled from dplyr
+```{r}
+select <- dplyr::select
+recode <- dplyr::recode
+```
+
+Next, log into PennBox, and set working directory the ABCD directory.
+```{r}
+box_auth()
+
+box_setwd('167848222541')
+```
+
+Load in dimensional data:
+```{r}
+all_dimensional_data<-box_read('1438646812672', fread=TRUE)
+```
+
+Read in biological data 
+```{r}
+bio<-box_read('1301072938826', fread=TRUE)
+bio<-bio[,c(2:5, 11)]
+bio$participant<-gsub('sub-NDARINV','NDAR_INV',bio$participant)
+ga<-box_read('1277090709031', fread=TRUE)
+bmi<-box_read('1441672468205', fread=TRUE)%>%
+  select(subjectkey, bmi)
+
+bio<- merge(bmi,bio , by.y='participant', by.x='subjectkey', all.x=T)
+```
+
+make a group variable (adolescents born at less than 33 weeks, 34–35 weeks, 36 weeks, 37–39 weeks, and 40 weeks of gestation)
+```{r}
+ga_clean<-as_tibble(ga)%>%
+  select(src_subject_id, eventname, birth_weight_lbs, birth_weight_oz, devhx_12a_p, devhx_12_p)%>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  mutate(birth_weight_oz=birth_weight_oz/16)%>%
+  mutate(bw= birth_weight_lbs +birth_weight_oz)%>%
+  recode_na_as(subset_cols= 'devhx_12_p', value=0)%>%
+  recode_as_na(subset_cols= 'devhx_12a_p', value=999)%>%
+  mutate(ga= 40-devhx_12_p)%>%
+  mutate(ga_group = case_when(
+      ga == 40 ~ "1",
+      ga >=37 & ga <=39  ~ "2",
+      ga == 36 ~ "3", 
+      ga >=34 & ga <=35 ~ "4", 
+      ga <=33 ~ "5"
+    ))%>%
+  select(src_subject_id, ga_group)
+
+bio<- merge(bio, ga_clean, by.x='subjectkey', by.y='src_subject_id')
+```
+
+Read in CBCL data that will be used to make the CU traits measure (expand by timepoint, select q26). 
+```{r}
+cbcl<-box_read('1277090142488')
+cbcl<- as_tibble(cbcl)%>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  select(src_subject_id, cbcl_scr_dsm5_depress_r, cbcl_scr_dsm5_anxdisord_r, 
+                     cbcl_scr_dsm5_adhd_r, cbcl_scr_dsm5_opposit_r,
+                     cbcl_scr_dsm5_conduct_r, cbcl_scr_dsm5_somaticpr_r)
+```
+
+Read in Cognitive Data 
+```{r}
+cog_data<-box_read('1022619576971', fread=TRUE)
+cog_data<-as_tibble(cog_data)%>%
+  slice(2:n()) %>% #drop the first row, which contains the variable definitions
+  dplyr::select(-collection_id,-abcd_tbss01_id,-dataset_id,-interview_date) %>% 
+  dplyr::select_if(~!(all(is.na(.)) | all(. == ""))) %>% #get rid of totally empty columns
+  mutate(across(everything(), ~ifelse(.=="", NA, as.character(.)))) #recode blank rows as "NA" 
+
+cog_data_short<- cog_data %>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  dplyr::select(ends_with(c("subjectkey", "uncorrected")))
+
+```
+
+Merge:
+```{r}
+all_data<- merge(all_dimensional_data, bio, by='subjectkey')
+all_data<- merge(all_data, cog_data_short, by='subjectkey')
+all_data<- merge(all_data, cbcl, by.x='subjectkey', by.y='src_subject_id')
+```
+
+------------------------------
+Run models 
+------------------------------
+
+Now, specify models to be run various times with different samples: 
+```{r}
+bw_model<- 'bw ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income'
+cog_model<- 'nihtbx_picvocab_uncorrected ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income'
+cbcl_model<- 'cbcl_scr_dsm5_adhd_r ~ GMV + age + sex + site_id + puberty_stage + ethnicity + race_3 + parent_education + combined_income'
+```
+
+```{r, results = 'hide', message = FALSE, warning = FALSE}
+set.seed(12345)
+
+# Initialize parameters
+sample_sizes <- seq(100, 6000, by=100)  # Define your sample sizes
+n_runs <- 100  # Number of repetitions
+effect_sizes <- data.frame()  # Create an empty data frame to store results
+
+# Main loop to run the model
+for (sample_size in sample_sizes) {
+  for (run in 1:n_runs) {
+    # Sample the data
+    sampled_data <- all_data[sample(1:nrow(all_data), sample_size, replace = TRUE), ]
+    
+    # Fit the linear model
+    fit <- sem(bw_model, data = sampled_data)
+    
+    # Extract effect sizes (e.g., standardized estimates)
+    effect_size <- parameterEstimates(fit, standardized = TRUE)
+    
+    # Directly extract the effect size for predictor1 (modify "predictor1" as needed)
+    predictor_effect <- filter(effect_size, lhs == "bw" & rhs == "GMV")
+    
+     # Store the result
+    effect_sizes <- rbind(effect_sizes, data.frame(sample_size = sample_size, effect_size_value = predictor_effect))
+  }
+}
+
+```
+
+```{r}
+# Plotting
+bio_plot<- ggplot(effect_sizes, aes(x = sample_size, y = effect_size_value.std.all)) +
+  geom_point(color="#f8766d7f", alpha=.25)+
+  geom_smooth(method = "loess", se = TRUE, level=.95, color = "#F8766D", fill="#F8766D") +  # Smooth line with confidence interval
+  labs(x = "Sample Size",
+       y = "Effect Size (cGM)") +
+  theme_minimal()
+
+bio_plot
+```
+
+```{r, results = 'hide', message = FALSE, warning = FALSE}
+set.seed(12345)
+
+# Initialize parameters
+sample_sizes <- seq(100, 6000, by=100)  # Define your sample sizes
+n_runs <- 100  # Number of repetitions
+effect_sizes <- data.frame()  # Create an empty data frame to store results
+
+# Main loop to run the model
+for (sample_size in sample_sizes) {
+  for (run in 1:n_runs) {
+    # Sample the data
+    sampled_data <- all_data[sample(1:nrow(all_data), sample_size, replace = TRUE), ]
+    
+    # Fit the linear model
+    fit <- sem(cbcl_model, data = sampled_data)
+    
+    # Extract effect sizes (e.g., standardized estimates)
+    effect_size <- parameterEstimates(fit, standardized = TRUE)
+    
+    # Directly extract the effect size for predictor1 (modify "predictor1" as needed)
+    predictor_effect <- filter(effect_size, lhs == "cbcl_scr_dsm5_adhd_r" & rhs == "GMV")
+    
+     # Store the result
+    effect_sizes <- rbind(effect_sizes, data.frame(sample_size = sample_size, effect_size_value = predictor_effect))
+  }
+}
+
+```
+
+
+```{r}
+# Plotting
+cbcl_plot<- ggplot(effect_sizes, aes(x = sample_size, y = effect_size_value.std.all)) +
+  geom_point(color='#00ba383e', alpha=.25)+
+  geom_smooth(method = "loess", se = TRUE, level=.95, color = "#00BA38", fill="#00BA38") +  # Smooth line with confidence interval
+  labs(x = "Sample Size",
+       y = "Effect Size (cGM)") +
+  theme_minimal()
+
+cbcl_plot
+```
+
+
+```{r, results = 'hide', message = FALSE, warning = FALSE}
+set.seed(12345)
+
+# Initialize parameters
+sample_sizes <- seq(100, 6000, by=100)  # Define your sample sizes
+n_runs <- 100  # Number of repetitions
+effect_sizes <- data.frame()  # Create an empty data frame to store results
+
+# Main loop to run the model
+for (sample_size in sample_sizes) {
+  for (run in 1:n_runs) {
+    # Sample the data
+    sampled_data <- all_data[sample(1:nrow(all_data), sample_size, replace = TRUE), ]
+    
+    # Fit the linear model
+    fit <- sem(cog_model, data = sampled_data)
+    
+    # Extract effect sizes (e.g., standardized estimates)
+    effect_size <- parameterEstimates(fit, standardized = TRUE)
+    
+    # Directly extract the effect size for predictor1 (modify "predictor1" as needed)
+    predictor_effect <- filter(effect_size, lhs == "nihtbx_picvocab_uncorrected" & rhs == "GMV")
+    
+     # Store the result
+    effect_sizes <- rbind(effect_sizes, data.frame(sample_size = sample_size, effect_size_value = predictor_effect))
+  }
+}
+
+```
+
+```{r}
+# Plotting
+cog_plot<- ggplot(effect_sizes, aes(x = sample_size, y = effect_size_value.std.all)) +
+  geom_point(color='#619cff5f', alpha=.25) +
+  geom_smooth(method = "loess", se = TRUE, level=.95, color = "#619CFF", fill="#619CFF") +  # Smooth line with confidence interval
+  labs(x = "Sample Size",
+       y = "Effect Size (cGM)") +
+  theme_minimal()
+  
+cog_plot 
+```
+
+Altogether:
+```{r}
+curves<- ggarrange(bio_plot, cog_plot, cbcl_plot, nrow=1, ncol=3)
+
+curves
+```

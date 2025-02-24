@@ -1,0 +1,701 @@
+---
+title: "Topography Matching Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R Notebook documents the steps taken to organize the data used for EDEN Lab's imaging propensity matching projects for the ABCD Dataset.
+
+First, install necessary packages.
+
+```{r}
+library(MatchIt)
+library(boxr)
+library(tidyr)
+library(dplyr)
+library(cobalt)
+library(ggplot2)
+library(finalfit)
+library(Hmisc)
+library(tidyverse)
+library(rstatix)
+library(ggpubr)
+```
+
+Specify that select function should be pulled from dplyr
+```{r}
+select <- dplyr::select
+`%ni%` = Negate(`%in%`)
+```
+
+Next, log into PennBox, and set working directory the project directory.
+```{r}
+box_auth()
+
+box_setwd('203279384208')
+```
+
+Read in covariate data, including T1 demos, family/site id's (filter for T1, select relevant v's). 
+```{r}
+#read in demos
+demos<-box_read('1277081419111', fread=TRUE)
+demos_trimmed<- as_tibble(demos)%>%
+  select(src_subject_id, demo_brthdat_v2, eventname, demo_sex_v2, demo_prnt_ed_v2, demo_comb_income_v2,
+         demo_ethn_v2)%>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  mutate(across(everything(), ~ifelse(.=="777", NA, as.character(.))))%>% #recode "unknown" cells as "NA" 
+  mutate(across(everything(), ~ifelse(.=="999", NA, as.character(.))))#recode "refused" cells as "NA" 
+
+#read in id's 
+ids<-box_read('1277070740402', fread=T)
+ids$site_id_l<-gsub('site','',ids$site_id_l)
+ids<-as_tibble(ids)%>%
+  filter(eventname=="baseline_year_1_arm_1")%>%
+  select(src_subject_id, site_id_l, rel_family_id)
+```
+
+Read in 7-category race that I coded earlier. 
+```{r}
+race<-box_read('1422910727882', fread=TRUE)
+race<- as_tibble(race)%>%
+  select(src_subject_id, race3)
+```
+
+read in puberty data (youth report) and collapse into one measure
+```{r}
+youth_pub<-box_read('1277086204139', fread=TRUE)
+youth_pub<-as_tibble(youth_pub)%>%
+  filter(eventname=="baseline_year_1_arm_1")%>%
+  select(src_subject_id, pds_sex_y, pds_y_ss_male_cat_2, pds_y_ss_female_category_2)%>%
+  mutate(across(everything(), ~ifelse(.=="777", NA, as.character(.))))%>% #recode "unknown" cells as "NA" 
+  mutate(across(everything(), ~ifelse(.=="999", NA, as.character(.))))#recode "refused" cells as "NA" 
+  
+yf_pub1<-filter(youth_pub, pds_sex_y == 2)%>%
+  select(src_subject_id, pds_y_ss_female_category_2)%>%
+  rename(pds_y_ss = pds_y_ss_female_category_2)
+ym_pub1<-filter(youth_pub, pds_sex_y == 1)%>%
+  select(src_subject_id, pds_y_ss_male_cat_2)%>%
+  rename(pds_y_ss = pds_y_ss_male_cat_2)
+
+ypub1<-rbind(yf_pub1, ym_pub1)
+```
+
+Now read in imaging inclusion data to match on:
+```{r}
+imaging_include<-box_read('1277078814392', fread=TRUE)
+imaging_include<-as_tibble(imaging_include)%>%
+  filter(eventname=='baseline_year_1_arm_1')%>%
+  select(src_subject_id, imgincl_t1w_include, imgincl_t2w_include)
+```
+
+Read in Structural Data/ motion measure, and add to data
+
+```{r}
+centiles<- box_read('1267779812594', fread=T)
+centiles$participant<-gsub('sub-NDARINV','NDAR_INV',centiles$participant)
+
+centiles<- rename(centiles, src_subject_id = participant)%>%
+  select(-sex, -site)
+
+euler<-box_read('1314622137417', fread=TRUE)
+euler$id<-gsub('sub-NDARINV','NDAR_INV',euler$id)
+euler<- rename(euler, src_subject_id = id)
+```
+Merge with matching data, and select relevant columns
+
+```{r}
+matching_data<- merge(ids, centiles, all.x=T)
+matching_data<- merge(matching_data, demos_trimmed)
+matching_data<- merge(matching_data, race, all=T)
+matching_data<- merge(matching_data, ypub1, all=T)
+matching_data<- merge(matching_data, imaging_include, all.x=T)
+matching_data<- merge(matching_data, euler, all.x=T)
+```
+
+write out this data set 
+```{r}
+#box_write(matching_data, file_name='matching_data_n11868_04.08.24.csv', dir_id ='203279384208')
+```
+
+```{r}
+data_trim<-matching_data%>%
+  filter(imgincl_t1w_include == 1)%>%
+  filter(imgincl_t2w_include == 1)%>%
+  dplyr::select(src_subject_id, demo_brthdat_v2, sex_recode,
+         site_id,pds_y_ss,demo_ethn_v2_recode, race3, Family,
+         demo_prnt_ed_v2, demo_comb_income_v2)%>%
+  mutate_at(c('demo_brthdat_v2','sex_recode', 'site_id',
+              'pds_y_ss','demo_ethn_v2_recode', 'race3', 'Family',
+              'demo_prnt_ed_v2', 'demo_comb_income_v2'),as.numeric)%>%
+  mutate(age_by_sex=(sex_recode*demo_brthdat_v2))%>%
+  drop_na() 
+```
+
+Rename variables for clarity.
+
+```{r}
+cols<-colnames(data_trim)
+cols
+```
+
+```{r}
+cols2<- c('subjectkey', 'age', 'sex', 'site_id', 'puberty_stage', 'ethnicity', 'race_3', 'family', 'parent_education', 'combined_income', 'age_by_sex')
+data_clean<-data_trim %>%
+  rename_at(all_of(cols), ~cols2)
+```
+
+Read in Structural Data and wrangle
+
+```{r}
+centiles<- box_read('1267779812594', fread=T)
+centiles$participant<-gsub('sub-NDARINV','NDAR_INV',centiles$participant)
+
+centiles<- rename(centiles, subjectkey = participant)
+
+euler<-box_read('1314622137417', fread=TRUE)
+euler$id<-gsub('sub-NDARINV','NDAR_INV',euler$id)
+euler<- rename(euler, subjectkey = id)
+```
+
+merge together
+```{r}
+all_data<- centiles%>%
+  select(-c(site, sex))%>%
+  merge(data_clean, by='subjectkey')
+
+all_data<-merge(all_data, euler)
+```
+
+randomly select one sibling per family 
+```{r}
+set.seed(12345) 
+
+all_data <-all_data %>% group_by(family) %>% slice_sample(n = 1) %>%  ungroup() 
+```
+
+Check distributions and save means and mads for indexing
+
+```{r}
+all_data%>%
+  select(GMV, WMV, sGMV, Ventricles)%>%
+  hist.data.frame()
+
+all_data%>%
+  select(GMV, WMV, sGMV, Ventricles)%>%
+  psych::describe()
+
+mads<-all_data%>%
+  select(GMV, WMV, sGMV, Ventricles)%>%
+  psych::describe()%>%
+  as_tibble()%>%
+  select(mean, median, mad)%>%
+  as.data.frame()
+
+rownames(mads)<-c('GMV','WMV','sGMV','Ventricles')
+```
+
+Save unmatched data for comparison. First, keep dimensional network sizes. 
+```{r}
+#box_write(all_data, file_name='unmatched_dimensional_data.02.05.24.csv', dir_id='218960591983')
+```
+
+
+Calculate high/low values and create group variable for each network (high= 1, treatment; low= 0, control), using p's one MAD above/below median (look in the tails). 
+
+```{r}
+high1<- filter(all_data, GMV>(mads[1,2]+mads[1,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+low1<- filter(all_data, GMV<(mads[1,2]-mads[1,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+GMV<-rbind(high1, low1)
+
+high2<- filter(all_data, WMV>(mads[2,2]+mads[2,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+low2<- filter(all_data, WMV<(mads[2,2]-mads[2,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+WMV<-rbind(high2, low2)
+
+high3<- filter(all_data, sGMV>(mads[3,2]+mads[3,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+low3<- filter(all_data, sGMV<(mads[3,2]-mads[3,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+sGMV<-rbind(high3, low3)
+
+high4<- filter(all_data, Ventricles>(mads[4,2]+mads[4,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+low4<- filter(all_data, Ventricles<(mads[4,2]-mads[4,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+Vent<-rbind(high4, low4)
+```
+
+merge each network group with clean data for matching
+
+```{r}
+GMV<-merge(GMV, all_data)
+WMV<-merge(WMV, all_data) 
+sGMV<-merge(sGMV, all_data)
+Vent<-merge(Vent, all_data)
+```
+
+write out median +/- 1 MAD split data. 
+
+```{r}
+#box_write(GMV, file_name='MAD_split_gmv_data_02.05.24.csv', dir_id='218960591983')
+#box_write(WMV, file_name='MAD_split_wmv_data_02.05.24.csv', dir_id='218960591983')
+#box_write(sGMV, file_name='MAD_split_sgmv_data_02.05.24.csv', dir_id='218960591983')
+#box_write(Vent, file_name='MAD_split_vent_data_02.05.24.csv', dir_id='218960591983')
+```
+
+```{r}
+new.names <- c(age = "Age (Years)",
+               sex_2 = "Sex",
+               age_by_sex = "Age*Sex",
+               site_id = "Site ID",
+               race_3 = "Race",
+               puberty_stage = "Puberty Stage",
+               ethnicity = "Ethnicity",
+               parent_education = "Parent Education",
+               combined_income = "Household Income",
+               euler = "Motion"
+)
+
+```
+match each measure:
+
+GMV:
+
+```{r}
+match_GMV <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 + 
+                       parent_education + combined_income + euler,
+                     data = GMV, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_GMV) 
+love.plot(match_GMV,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+match_GMV_data <- match.data(match_GMV)
+#box_write(match_GMV_data, file_name='match_GMV_data_treat_high_02.05.24.csv', dir_id='218960591983')
+```
+
+compare means
+
+
+WMV: 
+
+```{r}
+match_WMV <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                       parent_education + combined_income + euler, 
+                     data = WMV, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_WMV)
+love.plot(match_WMV,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+match_WMV_data <- match.data(match_WMV)
+#box_write(match_WMV_data, file_name='match_WMV_data_treat_high_02.05.24.csv', dir_id='218960591983')
+```
+
+
+
+sGMV: 
+
+```{r}
+match_sGMV <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                        parent_education + combined_income+ euler, 
+                     data = sGMV, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_sGMV)
+love.plot(match_sGMV,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+
+match_sGMV_data <- match.data(match_sGMV)
+#box_write(match_sGMV_data, file_name='match_sGMV_data_treat_high_02.05.24.csv', dir_id='218960591983')
+```
+
+Vent: 
+
+```{r}
+match_vent <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                      parent_education + combined_income+ euler, 
+                     data = Vent, caliper=0.05, method = "nearest", distance = "glm")
+
+summary(match_vent)
+love.plot(match_vent,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+match_vent_data <- match.data(match_vent)
+#box_write(match_vent_data, file_name='match_vent_data_treat_high_02.05.24.csv', dir_id='218960591983')
+```
+
+Redo based with re-assigned treatment and control groups (ie: low=1, high=0)
+
+Calculate high/low values and create group variable for each network:
+
+```{r}
+high1<- filter(all_data, GMV>(mads[1,2]+mads[1,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+low1<- filter(all_data, GMV<(mads[1,2]-mads[1,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+GMV_2<-rbind(high1, low1)
+
+high2<- filter(all_data, WMV>(mads[2,2]+mads[2,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+low2<- filter(all_data, WMV<(mads[2,2]-mads[2,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+WMV_2<-rbind(high2, low2)
+
+high3<- filter(all_data, sGMV>(mads[3,2]+mads[3,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+low3<- filter(all_data, sGMV<(mads[3,2]-mads[3,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+sGMV_2<-rbind(high3, low3)
+
+high4<- filter(all_data, Ventricles>(mads[4,2]+mads[4,3]))%>%
+  mutate(group=0)%>%
+  select(subjectkey, group)
+low4<- filter(all_data, Ventricles<(mads[4,2]-mads[4,3]))%>%
+  mutate(group=1)%>%
+  select(subjectkey, group)
+Vent_2<-rbind(high4, low4)
+```
+
+merge each network group with clean data for matching
+
+```{r}
+GMV_2<-merge(GMV_2, all_data)
+WMV_2<-merge(WMV_2, all_data) 
+sGMV_2<-merge(sGMV_2, all_data)
+Vent_2<-merge(Vent_2, all_data)
+```
+
+and match each network
+
+```{r}
+match_GMV_2 <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                         parent_education + combined_income + euler, 
+                     data = GMV_2, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_GMV_2)
+love.plot(match_GMV_2,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+match_GMV_data_2 <- match.data(match_GMV_2)
+#box_write(match_GMV_data_2, file_name='match_GMV_data_treat_low_02.05.24.csv', dir_id='218960591983')
+```
+
+```{r}
+match_WMV_2 <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                        parent_education + combined_income+ euler, 
+                     data =  WMV_2, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_WMV_2)
+love.plot(match_WMV_2,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+match_WMV_data_2 <- match.data(match_WMV_2)
+#box_write(match_WMV_data_2, file_name='match_WMV_data_treat_low_02.05.24.csv', dir_id='218960591983')
+```
+
+```{r}
+match_sGMV_2 <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                          parent_education + combined_income+ euler, 
+                     data =  sGMV_2, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_sGMV_2)
+love.plot(match_sGMV_2,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+
+match_sGMV_data_2 <- match.data(match_sGMV_2)
+#box_write(match_sGMV_data_2, file_name='match_sGMV_data_treat_low_02.05.24.csv', dir_id='218960591983')
+```
+
+```{r}
+match_vent_2 <- matchit(group ~ age + sex + age_by_sex + site_id + puberty_stage + ethnicity + race_3 +
+                          parent_education + combined_income+ euler, 
+                     data =  Vent_2, caliper=0.1, method = "nearest", distance = "glm")
+
+summary(match_vent_2)
+love.plot(match_vent_2,  drop.distance=TRUE, binary = "std", thresholds = c(m = .1), colors = c("red", "blue"), var.names =new.names)
+
+
+match_vent_data_2 <- match.data(match_vent_2)
+#box_write(match_vent_data_2, file_name='match_vent_data_treat_low_02.05.24.csv', dir_id='218960591983')
+```
+
+Check overlap between samples for each measure on high/low (ie: are the target high participants the same as the people who were pulled to match the target low participants)
+
+GMV (target=high)
+```{r}
+gmv_target_high<- filter(match_GMV_data, group==1)
+gmv_match_high<- filter(match_GMV_data_2, group==0)
+
+high_gmv_ids<-(intersect(gmv_target_high$subjectkey ,gmv_match_high$subjectkey))
+high_gmv<-filter(match_GMV_data, subjectkey %in% high_gmv_ids)
+```
+
+GMV (target=low)
+```{r}
+gmv_target_low<- filter(match_GMV_data_2, group==1)
+gmv_match_low<- filter(match_GMV_data, group==0)
+
+low_gmv_ids<-(intersect(gmv_target_low$subjectkey ,gmv_match_low$subjectkey))
+low_gmv<-filter(match_GMV_data, subjectkey %in% low_gmv_ids)
+```
+
+all gmv:
+```{r}
+match_gmv<- rbind(high_gmv, low_gmv)
+#box_write(match_gmv, file_name='match_gmv_data_overlap_02.05.24.csv', dir_id='218960591983')
+```
+
+WMV (target=high)
+```{r}
+wmv_target_high<- filter(match_WMV_data, group==1)
+wmv_match_high<- filter(match_WMV_data_2, group==0)
+
+high_wmv_ids<-(intersect(wmv_target_high$subjectkey ,wmv_match_high$subjectkey))
+high_wmv<-filter(match_WMV_data, subjectkey %in% high_wmv_ids)
+```
+
+WMV (target=low)
+```{r}
+wmv_target_low<- filter(match_WMV_data_2, group==1)
+wmv_match_low<- filter(match_WMV_data, group==0)
+
+low_wmv_ids<-(intersect(wmv_target_low$subjectkey ,wmv_match_low$subjectkey))
+low_wmv<-filter(match_WMV_data, subjectkey %in% low_wmv_ids)
+```
+
+all wmv:
+```{r}
+match_wmv<- rbind(high_wmv, low_wmv)
+#box_write(match_wmv, file_name='match_wmv_data_overlap_02.05.24.csv', dir_id='218960591983')
+```
+
+sGMV (target=high)
+```{r}
+sgmv_target_high<- filter(match_sGMV_data, group==1)
+sgmv_match_high<- filter(match_sGMV_data_2, group==0)
+
+high_sgmv_ids<-(intersect(sgmv_target_high$subjectkey ,sgmv_match_high$subjectkey))
+high_sgmv<-filter(match_sGMV_data, subjectkey %in% high_sgmv_ids)
+```
+
+sGMV (target=low)
+```{r}
+sgmv_target_low<- filter(match_sGMV_data_2, group==1)
+sgmv_match_low<- filter(match_sGMV_data, group==0)
+
+low_sgmv_ids<-(intersect(sgmv_target_low$subjectkey ,sgmv_match_low$subjectkey))
+low_sgmv<-filter(match_sGMV_data, subjectkey %in% low_sgmv_ids)
+```
+
+all sgmv:
+```{r}
+match_sgmv<- rbind(high_sgmv, low_sgmv)
+#box_write(match_sgmv, file_name='match_sgmv_data_overlap_02.05.24.csv', dir_id='218960591983')
+```
+
+vent (target=high)
+```{r}
+vent_target_high<- filter(match_vent_data, group==1)
+vent_match_high<- filter(match_vent_data_2, group==0)
+
+high_vent_ids<-(intersect(vent_target_high$subjectkey ,vent_match_high$subjectkey))
+high_vent<-filter(match_vent_data, subjectkey %in% high_vent_ids)
+```
+
+vent (target=low)
+```{r}
+vent_target_low<- filter(match_vent_data_2, group==1)
+vent_match_low<- filter(match_vent_data, group==0)
+
+low_vent_ids<-(intersect(vent_target_low$subjectkey ,vent_match_low$subjectkey))
+low_vent<-filter(match_vent_data, subjectkey %in% low_vent_ids)
+```
+
+all vent:
+```{r}
+match_vent<- rbind(high_vent, low_vent)
+#box_write(match_vent, file_name='match_vent_data_overlap_02.05.24.csv', dir_id='218960591983')
+```
+Graph distributions 
+
+```{r}
+hist(match_gmv$GMV)
+g1<-ggplot(match_gmv, aes(x=GMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white") +
+ geom_density(alpha=.2, fill="#FF6666") 
+
+g2<-ggplot(GMV, aes(x=GMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+g3<-ggplot(centiles, aes(x=GMV))+geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+gplots<-ggarrange(g3,g2,g1, nrow=3, ncol=1)
+gplots
+```
+
+```{r}
+w1<-ggplot(match_wmv, aes(x=WMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+w2<-ggplot(WMV, aes(x=WMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+w3<-ggplot(centiles, aes(x=WMV))+geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+wplots<-ggarrange(w3,w2,w1, nrow=3, ncol=1)
+wplots
+```
+```{r}
+s1<-ggplot(match_sgmv, aes(x=sGMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+s2<-ggplot(sGMV, aes(x=sGMV)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+s3<-ggplot(centiles, aes(x=sGMV))+geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+
+splots<-ggarrange(s3,s2,s1, nrow=3, ncol=1)
+splots
+```
+```{r}
+v1<-ggplot(match_vent, aes(x=Ventricles)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+v2<-ggplot(Vent, aes(x=Ventricles)) +geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+v3<-ggplot(centiles, aes(x=Ventricles))+geom_histogram(aes(y=..density..), colour="black", fill="white")+
+ geom_density(alpha=.2, fill="#FF6666") 
+
+vplots<-ggarrange(v3,v2,v1, nrow=3, ncol=1)
+vplots
+```
+
+Check race breakdown for each sample
+```{r}
+ggplot(match_gmv, aes(x=race_3)) +geom_histogram()
+ggplot(match_wmv, aes(x=race_3)) +geom_histogram()
+ggplot(match_sgmv, aes(x=race_3)) +geom_histogram()
+ggplot(match_vent, aes(x=race_3)) +geom_histogram()
+```
+
+Filter for white/black participants 
+```{r}
+prs_gmv<- filter(match_gmv, race_3%in%c(1,2)) #646
+length(prs_gmv$subjectkey) 
+length(match_gmv$subjectkey)
+prs_wmv<- filter(match_wmv, race_3%in%c(1,2)) #845
+length(prs_wmv$subjectkey)
+length(match_wmv$subjectkey)
+prs_sgmv<- filter(match_sgmv, race_3%in%c(1,2)) #756
+length(prs_sgmv$subjectkey)
+length(match_sgmv$subjectkey)
+prs_vent<- filter(match_vent, race_3%in%c(1,2)) #472
+length(prs_vent$subjectkey)
+length(match_vent$subjectkey)
+```
+Check differences in demographics across target/matched groups per measure
+
+high gmv (target=1, match=0)
+```{r}
+rbind(gmv_target_high, gmv_match_high)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+low gmv (target=1, match=0)
+```{r}
+rbind(gmv_target_low, gmv_match_low)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+high wmv (target=1, match=0)
+```{r}
+rbind(wmv_target_high, wmv_match_high)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+low wmv (target=1, match=0)
+```{r}
+rbind(wmv_target_low, wmv_match_low)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+high sgmv (target=1, match=0)
+```{r}
+rbind(sgmv_target_high, sgmv_match_high)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+low sgmv (target=1, match=0)
+```{r}
+rbind(sgmv_target_low, sgmv_match_low)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+high vent (target=1, match=0)
+```{r}
+rbind(vent_target_high, vent_match_high)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```
+
+low vent (target=1, match=0)
+```{r}
+rbind(vent_target_low, vent_match_low)%>%
+  select(-c(distance, weights, subclass))%>%
+  pivot_longer(-c(group, subjectkey), names_to = 'variables', values_to = 'value')%>%
+  group_by(variables) %>%
+  t_test(value ~ group) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance()
+```

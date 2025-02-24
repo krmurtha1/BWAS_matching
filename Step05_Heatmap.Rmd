@@ -1,0 +1,88 @@
+```{r}
+library(plyr)
+library(ggplot2)
+library(dplyr)  
+library(viridis)
+library(ggExtra)
+library(boxr)
+library(dichromat)
+```
+
+
+```{r}
+box_auth()
+```
+```{r}
+all_bio<- box_read('1678585415954', fread=T)
+all_cbcl<- box_read('1678554911546', fread=T)
+all_cog<- box_read('1678586025131', fread=T)
+```
+
+```{r}
+all_bio<-all_bio%>%
+  mutate(model_type='bio')
+
+all_cog<-all_cog%>%
+  mutate(model_type='cog')
+
+all_cbcl<-all_cbcl%>%
+  mutate(model_type='cbcl')
+
+all_stats<-rbind(all_bio, all_cog, all_cbcl)
+```
+  
+Reorder and rename outcomes
+```{r}
+all_stats$type <- factor(all_stats$type, level = c("dim", "tails", "matched"))
+
+all_stats$lhs_2 <- factor(all_stats$lhs, levels = c("cbcl_scr_dsm5_anxdisord_r", "cbcl_scr_dsm5_depress_r", "cbcl_scr_dsm5_adhd_r",
+                                                    "cbcl_scr_dsm5_conduct_r", "cbcl_scr_dsm5_opposit_r", "cbcl_scr_dsm5_somaticpr_r",
+                                                    "nihtbx_cardsort_uncorrected", "nihtbx_flanker_uncorrected", "nihtbx_list_uncorrected",
+                                                    "nihtbx_pattern_uncorrected", "nihtbx_picture_uncorrected","nihtbx_picvocab_uncorrected",
+                                                    "nihtbx_reading_uncorrected", "bw", "ga_group", "bmi"))
+
+all_stats$lhs_2 <- revalue(all_stats$lhs_2, c("cbcl_scr_dsm5_anxdisord_r" = "Anxiety Symptoms", 
+                                                                            "cbcl_scr_dsm5_depress_r" ="Depression Symptoms", 
+                                                                            "cbcl_scr_dsm5_adhd_r" = "ADHD Symptoms",
+                                                                            "cbcl_scr_dsm5_conduct_r" = "CD Symptoms", 
+                                                                            "cbcl_scr_dsm5_opposit_r" = "ODD Symptoms", 
+                                                                            "cbcl_scr_dsm5_somaticpr_r" = "Somatic Symptoms", 
+                                                                            "nihtbx_cardsort_uncorrected" = "Cognitive Flexibility", 
+                                                                            "nihtbx_flanker_uncorrected" = "Inhibitory Control", 
+                                                                            "nihtbx_list_uncorrected" = "Working Memory", 
+                                                                            "nihtbx_pattern_uncorrected" = "Visual Processing",
+                                                                            "nihtbx_picture_uncorrected" = "Episodic Memory", 
+                                                                            "nihtbx_picvocab_uncorrected" = "Language",
+                                                                            "nihtbx_reading_uncorrected" = "Reading", 
+                                                                            "bw" = "Birth Weight", 
+                                                                            "ga_group" = "Gestational Age", 
+                                                                            "bmi" = "Body Mass Index"))
+```
+
+
+```{r}
+custom_colors <- colorRampPalette(c("blue","darkturquoise","white", "yellow", "red"))
+
+facet1_names <- list("GMV" = "cGM", "sGMV" = "sGM", "vent" = "CSF", "WMV" = "WM")
+facet2_names <- list("bio" = "Biological Outcomes", "cbcl" = "Psychological Outcomes", "cog" = "Cognitive Outcomes")
+
+p2 <-ggplot(all_stats, aes(y=type,x=lhs_2,fill=std.all))+
+  geom_tile(color=ifelse(all_stats$ps_fdr<0.05, "black", "grey"), 
+            lwd = ifelse(all_stats$ps_fdr<0.05, .5, 0), 
+            linetype = 1) + 
+  scale_fill_gradientn(colors = custom_colors(5), limits = c(-0.35, 0.35))+
+  coord_flip() +
+  facet_grid(cols = vars(rhs), as.table = TRUE) +
+  labs(x="", y="", fill="Beta Value") +
+  scale_y_discrete(labels=c("Dimensional", "Tail-Sampled", "Propensity Matched")) + 
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, vjust=1, hjust=1, size=13), 
+        axis.text.y = element_text(size=13), 
+        strip.text = element_text(size = 14))
+
+p2
+ggsave(file="heatmap_v2.svg", plot=p2, width=10, height=8)
+
+```
+
+  
